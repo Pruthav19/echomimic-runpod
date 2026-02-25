@@ -9,14 +9,21 @@ def download_models():
     print(f"📥 Downloading EchoMimic models to {MODEL_DIR}...")
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    # 1. Main EchoMimic Weights
-    snapshot_download(repo_id="BadToBest/EchoMimic", local_dir=os.path.join(MODEL_DIR, "EchoMimic"))
-    
-    # 2. Stable Diffusion VAE
+    # 1. Main EchoMimic weights — MUST land directly in MODEL_DIR (not a subdir).
+    #    start.sh symlinks MODEL_DIR → /app/EchoMimic/pretrained_weights, so
+    #    files here map to ./pretrained_weights/<file> as the yaml config expects.
+    #    This repo includes: denoising_unet.pth, reference_unet.pth,
+    #    face_locator.pth, motion_module.pth, audio_processor/whisper_tiny.pt
+    snapshot_download(repo_id="BadToBest/EchoMimic", local_dir=MODEL_DIR)
+
+    # 2. SD Image Variations — backbone for the reference UNet
+    snapshot_download(
+        repo_id="lambdalabs/sd-image-variations-diffusers",
+        local_dir=os.path.join(MODEL_DIR, "sd-image-variations-diffusers"),
+    )
+
+    # 3. Stable Diffusion VAE
     snapshot_download(repo_id="stabilityai/sd-vae-ft-mse", local_dir=os.path.join(MODEL_DIR, "sd-vae-ft-mse"))
-    
-    # 3. Audio Processor (Whisper)
-    snapshot_download(repo_id="openai/whisper-small", local_dir=os.path.join(MODEL_DIR, "whisper-small"))
 
     # 4. GFPGAN v1.4 — face restoration weights
     gfpgan_path = os.path.join(MODEL_DIR, "GFPGANv1.4.pth")

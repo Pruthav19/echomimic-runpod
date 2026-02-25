@@ -36,14 +36,18 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install gfpgan
 RUN pip install -r requirements.txt
 
-# ── 5. Lock HuggingFace stack to mutually compatible versions ────
+# ── 5. Lock HuggingFace stack + NumPy to mutually compatible versions ──
 # huggingface_hub==0.21.3: last version with cached_download (used by
 # old diffusers) AND is_offline_mode (required by transformers).
 # transformers 4.37.x: last series known to work with hf_hub 0.21.x
 # and PyTorch 2.2.0 on this base image.
+# numpy<2.0: gfpgan/basicsr pull in numpy 2.x which breaks torch on this image.
+# accelerate: prevents low_cpu_mem_usage fallback warning / slower loads.
 RUN pip install --force-reinstall \
     "huggingface_hub==0.21.3" \
-    "transformers>=4.35.0,<4.40.0"
+    "transformers>=4.35.0,<4.40.0" \
+    "numpy<2.0" \
+    "accelerate"
 
 # ── 6. Copy Scripts ──────────────────────────────────────────────
 COPY download_models.py /app/download_models.py
