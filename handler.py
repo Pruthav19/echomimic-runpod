@@ -85,16 +85,24 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
         yaml.dump(config_data, f)
 
     # 5. Run EchoMimic Inference
-    # infer_audio2vid.py reads W/H/steps/cfg/fps/seed from CLI args, NOT the
-    # yaml config — so we must forward them explicitly here.
-    w    = int(user_params.get("target_size",     512))
-    h    = int(user_params.get("target_size",     512))
-    steps = int(user_params.get("inference_steps", 40))
-    cfg  = float(user_params.get("cfg_scale",      3.0))
-    fps  = int(user_params.get("fps",              24))
-    seed = int(user_params.get("seed",             42))
-    ctx_frames  = int(user_params.get("context_frames",  12))
-    ctx_overlap = int(user_params.get("context_overlap",  3))
+    # infer_audio2vid.py reads ALL visual params from CLI args, NOT the yaml config.
+    w    = int(user_params.get("target_size",       512))
+    h    = int(user_params.get("target_size",       512))
+    steps = int(user_params.get("inference_steps",   40))
+    cfg  = float(user_params.get("cfg_scale",        2.5))  # 2.5 keeps expressions natural; 3.0+ causes stiffness
+    fps  = int(user_params.get("fps",                24))
+    seed = int(user_params.get("seed",               42))
+    ctx_frames  = int(user_params.get("context_frames",   12))
+    ctx_overlap = int(user_params.get("context_overlap",   3))
+
+    # facecrop_dilation_ratio: how much padding around the face box for the reference crop
+    #   0.5 = default (tight); 1.2 = generous shoulder/hair room
+    facecrop_dilation = float(user_params.get("face_expand_ratio",    0.5))
+
+    # facemusk_dilation_ratio: how far the animated mask extends around the face box
+    #   0.1 = default but covers eyes → causes winking artefact
+    #   0.05 = tighter, keeps mask on mouth/chin region only → no winking
+    facemask_dilation = float(user_params.get("face_mask_dilation",   0.05))
 
     cmd = [
         "python", "-u", "infer_audio2vid.py",
@@ -105,8 +113,10 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
         "--cfg",    str(cfg),
         "--fps",    str(fps),
         "--seed",   str(seed),
-        "--context_frames",  str(ctx_frames),
-        "--context_overlap", str(ctx_overlap),
+        "--context_frames",        str(ctx_frames),
+        "--context_overlap",       str(ctx_overlap),
+        "--facecrop_dilation_ratio", str(facecrop_dilation),
+        "--facemusk_dilation_ratio", str(facemask_dilation),
     ]
 
     logger.info(f"Running EchoMimic with config: {config_data}")
