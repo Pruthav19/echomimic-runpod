@@ -8,6 +8,8 @@ import yaml
 import logging
 import glob
 
+from preprocess import preprocess_image
+
 WORKSPACE = "/tmp/workspace"
 ECHOMIMIC_DIR = "/app/EchoMimic"
 S3_BUCKET = os.environ.get("S3_BUCKET", "your-bucket-name")
@@ -114,10 +116,23 @@ def handler(event):
             return {"error": "avatar_image_url and audio_url are required"}
 
         # 1. Download Inputs
-        image_path = os.path.join(job_dir, "avatar.png")
-        audio_path = os.path.join(job_dir, "audio.wav")
-        download_file(input_data["avatar_image_url"], image_path)
+        raw_image_path  = os.path.join(job_dir, "avatar_raw.png")
+        image_path      = os.path.join(job_dir, "avatar.png")
+        audio_path      = os.path.join(job_dir, "audio.wav")
+        download_file(input_data["avatar_image_url"], raw_image_path)
         download_file(input_data["audio_url"], audio_path)
+
+        # 1b. Preprocess image for maximum quality
+        #     • Smart portrait crop   → proper talking-head framing
+        #     • GFPGAN v1.4 restore   → sharpen/enhance face details (2× upscale)
+        #     • White-balance fix     → neutralise colour casts
+        skip_preprocess = input_data.get("skip_preprocess", False)
+        if skip_preprocess:
+            import shutil
+            shutil.copy(raw_image_path, image_path)
+            logger.info("Image preprocessing skipped (skip_preprocess=true).")
+        else:
+            preprocess_image(raw_image_path, image_path)
 
         # 2. Run Generation (now passing the entire input payload to extract params)
         final_video_path = run_echomimic(image_path, audio_path, job_dir, input_data)

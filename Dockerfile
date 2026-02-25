@@ -32,6 +32,8 @@ RUN pip install onnxruntime-gpu "numpy<2.0"
 # ── 4. Install Serverless Handler Dependencies ───────────────────
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
+# Install gfpgan first so basicsr/facexlib are resolved before the hf_hub pin
+RUN pip install gfpgan
 RUN pip install -r requirements.txt
 
 # ── 5. Lock HuggingFace stack to mutually compatible versions ────
@@ -46,6 +48,7 @@ RUN pip install --force-reinstall \
 # ── 6. Copy Scripts ──────────────────────────────────────────────
 COPY download_models.py /app/download_models.py
 COPY handler.py /app/handler.py
+COPY preprocess.py /app/preprocess.py
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
