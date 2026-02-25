@@ -25,6 +25,8 @@ WORKDIR /app/EchoMimic
 RUN pip install -r requirements.txt
 
 # 🚨 THE MAGIC FIXES: Downgrade protobuf and force correct mediapipe
+# Pin huggingface_hub before other installs override it
+RUN pip install "huggingface_hub<0.23.0"
 RUN pip install "protobuf<4"
 RUN pip uninstall -y mediapipe && pip install mediapipe==0.10.15
 RUN pip install onnxruntime-gpu "numpy<2.0"
