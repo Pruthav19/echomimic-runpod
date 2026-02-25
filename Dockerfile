@@ -27,7 +27,7 @@ RUN pip install -r requirements.txt
 # 🚨 THE MAGIC FIXES: Downgrade protobuf and force correct mediapipe
 RUN pip install "protobuf<4"
 RUN pip uninstall -y mediapipe && pip install mediapipe==0.10.15
-RUN pip install onnxruntime-gpu "numpy<2.0"
+RUN pip install onnxruntime-gpu "numpy<2.0" "opencv-python<4.10.0" "opencv-contrib-python<4.10.0" "opencv-python-headless<4.10.0"
 
 # ── 4. Install Serverless Handler Dependencies ───────────────────
 WORKDIR /app
