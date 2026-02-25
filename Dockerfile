@@ -10,7 +10,9 @@ RUN pip install --upgrade pip
 
 # ── 1. System Dependencies (Crucial for OpenCV & MediaPipe) ──────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg libgl1-mesa-glx libglib2.0-0 git wget curl \
+    ffmpeg libgl1-mesa-glx libglib2.0-0 git wget curl pkg-config \
+    libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
+    libswscale-dev libswresample-dev libavfilter-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
