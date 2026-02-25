@@ -25,8 +25,6 @@ WORKDIR /app/EchoMimic
 RUN pip install -r requirements.txt
 
 # 🚨 THE MAGIC FIXES: Downgrade protobuf and force correct mediapipe
-# Pin huggingface_hub before other installs override it
-RUN pip install "huggingface_hub<0.23.0"
 RUN pip install "protobuf<4"
 RUN pip uninstall -y mediapipe && pip install mediapipe==0.10.15
 RUN pip install onnxruntime-gpu "numpy<2.0"
@@ -36,7 +34,16 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r requirements.txt
 
-# ── 5. Copy Scripts ──────────────────────────────────────────────
+# ── 5. Lock HuggingFace stack to mutually compatible versions ────
+# huggingface_hub==0.21.3: last version with cached_download (used by
+# old diffusers) AND is_offline_mode (required by transformers).
+# transformers 4.37.x: last series known to work with hf_hub 0.21.x
+# and PyTorch 2.2.0 on this base image.
+RUN pip install --force-reinstall \
+    "huggingface_hub==0.21.3" \
+    "transformers>=4.35.0,<4.40.0"
+
+# ── 6. Copy Scripts ──────────────────────────────────────────────
 COPY download_models.py /app/download_models.py
 COPY handler.py /app/handler.py
 COPY start.sh /app/start.sh
