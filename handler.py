@@ -85,9 +85,28 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
         yaml.dump(config_data, f)
 
     # 5. Run EchoMimic Inference
+    # infer_audio2vid.py reads W/H/steps/cfg/fps/seed from CLI args, NOT the
+    # yaml config — so we must forward them explicitly here.
+    w    = int(user_params.get("target_size",     512))
+    h    = int(user_params.get("target_size",     512))
+    steps = int(user_params.get("inference_steps", 40))
+    cfg  = float(user_params.get("cfg_scale",      3.0))
+    fps  = int(user_params.get("fps",              24))
+    seed = int(user_params.get("seed",             42))
+    ctx_frames  = int(user_params.get("context_frames",  12))
+    ctx_overlap = int(user_params.get("context_overlap",  3))
+
     cmd = [
         "python", "-u", "infer_audio2vid.py",
-        "--config", job_config_path
+        "--config", job_config_path,
+        "-W",       str(w),
+        "-H",       str(h),
+        "--steps",  str(steps),
+        "--cfg",    str(cfg),
+        "--fps",    str(fps),
+        "--seed",   str(seed),
+        "--context_frames",  str(ctx_frames),
+        "--context_overlap", str(ctx_overlap),
     ]
 
     logger.info(f"Running EchoMimic with config: {config_data}")
