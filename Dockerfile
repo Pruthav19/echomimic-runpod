@@ -36,14 +36,20 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install gfpgan
 RUN pip install -r requirements.txt
 
-# ── 5. Lock HuggingFace stack + NumPy to mutually compatible versions ──
-# huggingface_hub==0.21.3: last version with cached_download (used by
-# old diffusers) AND is_offline_mode (required by transformers).
-# transformers 4.37.x: last series known to work with hf_hub 0.21.x
-# and PyTorch 2.2.0 on this base image.
-# numpy<2.0: gfpgan/basicsr pull in numpy 2.x which breaks torch on this image.
-# accelerate: prevents low_cpu_mem_usage fallback warning / slower loads.
+# ── 5. Lock entire stack to mutually compatible versions ─────────
+# torch/torchvision/torchaudio: gfpgan can pull in a mismatched torchvision
+#   (built against a different torch ABI) causing "torchvision::nms does not exist".
+#   Force the exact CUDA 12.1 wheels matching the base image's torch 2.2.0.
+# huggingface_hub==0.21.3: has both cached_download and is_offline_mode.
+# transformers<4.40: compatible with hf_hub 0.21.x and torch 2.2.0.
+# numpy<2.0: gfpgan/basicsr silently pull in numpy 2.x which breaks torch here.
+# accelerate: prevents low_cpu_mem_usage fallback / slower model loads.
 RUN pip install --force-reinstall \
+    --index-url https://download.pytorch.org/whl/cu121 \
+    "torch==2.2.0" \
+    "torchvision==0.17.0" \
+    "torchaudio==2.2.0" \
+  && pip install --force-reinstall \
     "huggingface_hub==0.21.3" \
     "transformers>=4.35.0,<4.40.0" \
     "numpy<2.0" \
