@@ -38,18 +38,21 @@ RUN pip install gfpgan --no-deps
 RUN pip install basicsr facexlib realesrgan
 RUN pip install -r requirements.txt
 
-# ── 5. Lock HuggingFace stack + NumPy ────────────────────────────
+# ── 5. Lock HuggingFace stack + NumPy + Torch ────────────────────────────
 # huggingface_hub==0.21.3: has both cached_download and is_offline_mode.
 # transformers<4.40: compatible with hf_hub 0.21.x and torch 2.2.0.
 # numpy<2.0: basicsr/realesrgan pull in numpy 2.x which breaks torch here.
 # accelerate: prevents low_cpu_mem_usage fallback / slower model loads.
-# torch/torchvision are NOT reinstalled — base image already has the correct
-# CUDA 12.1 wheels, and --no-deps above ensures nothing overwrote them.
+# torch/torchvision are reinstalled with correct CUDA 12.1 wheels to fix
+# overwrites caused by basicsr/facexlib/realesrgan missing --no-deps.
 RUN pip install --force-reinstall \
     "huggingface_hub==0.21.3" \
     "transformers>=4.35.0,<4.40.0" \
     "numpy<2.0" \
-    "accelerate"
+    "accelerate" \
+    "torch==2.2.0" \
+    "torchvision==0.17.0" \
+    --extra-index-url https://download.pytorch.org/whl/cu121
 
 # ── 6. Copy Scripts ──────────────────────────────────────────────
 COPY download_models.py /app/download_models.py
