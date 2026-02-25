@@ -32,24 +32,20 @@ RUN pip install onnxruntime-gpu "numpy<2.0"
 # ── 4. Install Serverless Handler Dependencies ───────────────────
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
-# Install gfpgan first so basicsr/facexlib are resolved before the hf_hub pin
-RUN pip install gfpgan
+# Install gfpgan with --no-deps so pip NEVER touches torch/torchvision.
+# Then manually add only gfpgan's non-torch runtime deps.
+RUN pip install gfpgan --no-deps
+RUN pip install basicsr facexlib realesrgan
 RUN pip install -r requirements.txt
 
-# ── 5. Lock entire stack to mutually compatible versions ─────────
-# torch/torchvision/torchaudio: gfpgan can pull in a mismatched torchvision
-#   (built against a different torch ABI) causing "torchvision::nms does not exist".
-#   Force the exact CUDA 12.1 wheels matching the base image's torch 2.2.0.
+# ── 5. Lock HuggingFace stack + NumPy ────────────────────────────
 # huggingface_hub==0.21.3: has both cached_download and is_offline_mode.
 # transformers<4.40: compatible with hf_hub 0.21.x and torch 2.2.0.
-# numpy<2.0: gfpgan/basicsr silently pull in numpy 2.x which breaks torch here.
+# numpy<2.0: basicsr/realesrgan pull in numpy 2.x which breaks torch here.
 # accelerate: prevents low_cpu_mem_usage fallback / slower model loads.
+# torch/torchvision are NOT reinstalled — base image already has the correct
+# CUDA 12.1 wheels, and --no-deps above ensures nothing overwrote them.
 RUN pip install --force-reinstall \
-    --index-url https://download.pytorch.org/whl/cu121 \
-    "torch==2.2.0" \
-    "torchvision==0.17.0" \
-    "torchaudio==2.2.0" \
-  && pip install --force-reinstall \
     "huggingface_hub==0.21.3" \
     "transformers>=4.35.0,<4.40.0" \
     "numpy<2.0" \
