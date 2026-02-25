@@ -1,4 +1,4 @@
-name: Build and Push Docker Image Echommic
+name: Build and Push Docker Image Echomimic
 
 on:
   push:
@@ -28,7 +28,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ secrets.DOCKERHUB_USERNAME }}/hallo2-runpod
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/echomimic-runpod
           tags: |
             type=raw,value=latest
             type=sha
@@ -41,7 +41,7 @@ jobs:
 
           USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
           TOKEN="${{ secrets.DOCKERHUB_TOKEN }}"
-          REPO="hallo2-runpod"
+          REPO="echomimic-runpod"
 
           JWT=$(curl -fsSL -X POST "https://hub.docker.com/v2/users/login/" \
             -H "Content-Type: application/json" \
@@ -68,7 +68,7 @@ jobs:
           push: true
           tags: |
             ${{ steps.meta.outputs.tags }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/hallo2-runpod:${{ steps.version.outputs.next_tag }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/echomimic-runpod:${{ steps.version.outputs.next_tag }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
