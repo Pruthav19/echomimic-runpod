@@ -21,22 +21,11 @@ WORKDIR /app
 RUN git clone https://github.com/BadToBest/EchoMimic.git /app/EchoMimic
 
 # ── 2b. Patch: shift face mask to start from nose level ──────────
-# The default mask starts at the top of the MTCNN bbox which covers the eyes,
-# causing a one-eye-winking artefact. We shift it to start 33% down
-# (nose bridge level) so only the mouth/chin region is animated.
-RUN python3 -c "
-import re
-path = '/app/EchoMimic/infer_audio2vid.py'
-with open(path) as f:
-    src = f.read()
-old = 'face_mask[rb - r_pad : re + r_pad, cb - c_pad : ce + c_pad] = 255'
-new = 'face_mask[rb + int((re - rb) * 0.33) : re + r_pad, cb - c_pad : ce + c_pad] = 255'
-assert old in src, 'Pattern not found — check EchoMimic version'
-src = src.replace(old, new)
-with open(path, 'w') as f:
-    f.write(src)
-print('Patched: face mask now starts from nose level')
-"
+# The default mask starts at the top of the MTCNN bbox (eye level), causing
+# a one-eye-winking artefact. We shift it to start 33% down (nose bridge)
+# so only the mouth/chin region is animated.
+COPY patch_echomimic.py /app/patch_echomimic.py
+RUN python3 /app/patch_echomimic.py
 
 # ── 3. Install EchoMimic Dependencies ────────────────────────────
 WORKDIR /app/EchoMimic
@@ -76,6 +65,7 @@ RUN pip install --force-reinstall \
 COPY download_models.py /app/download_models.py
 COPY handler.py /app/handler.py
 COPY preprocess.py /app/preprocess.py
+COPY patch_echomimic.py /app/patch_echomimic.py
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
