@@ -99,10 +99,11 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
     #   0.5 = default (tight); 1.2 = generous shoulder/hair room
     facecrop_dilation = float(user_params.get("face_expand_ratio",    0.5))
 
-    # facemusk_dilation_ratio: how far the animated mask extends around the face box
-    #   0.1 = default but covers eyes → causes winking artefact
-    #   0.05 = tighter, keeps mask on mouth/chin region only → no winking
-    facemask_dilation = float(user_params.get("face_mask_dilation",   0.05))
+    # facemusk_dilation_ratio: padding around the face bbox for the animated mask.
+    #   The EchoMimic source is already patched to start the mask from nose level,
+    #   so 0.0 here means zero extra padding beyond that lower-face region.
+    #   Increase slightly (e.g. 0.05) only if mouth corners feel clipped.
+    facemask_dilation = float(user_params.get("face_mask_dilation",   0.0))
 
     cmd = [
         "python", "-u", "infer_audio2vid.py",
@@ -163,8 +164,15 @@ def handler(event):
         else:
             preprocess_image(raw_image_path, image_path)
 
-        # 2. Run Generation (now passing the entire input payload to extract params)
+        # 2. Run Generation
         final_video_path = run_echomimic(image_path, audio_path, job_dir, input_data)
+
+        # 2b. Post-process: Real-ESRGAN 2× upscale (512→1024) + H.264 CRF 16
+        skip_enhance = input_data.get("skip_enhance", False)
+        if not skip_enhance:
+            from preprocess import enhance_video
+            enhanced_path = os.path.join(job_dir, "output_enhanced.mp4")
+            final_video_path = enhance_video(final_video_path, enhanced_path)
 
         # 3. Upload to S3
         s3_key = f"echomimic_videos/{job_id}.mp4"
