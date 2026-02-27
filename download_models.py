@@ -25,7 +25,7 @@ def download_models():
     # 3. Stable Diffusion VAE
     snapshot_download(repo_id="stabilityai/sd-vae-ft-mse", local_dir=os.path.join(MODEL_DIR, "sd-vae-ft-mse"))
 
-    # 4. GFPGAN v1.4 — face restoration weights
+    # 4. GFPGAN v1.4 — face restoration weights (input image enhancement)
     gfpgan_path = os.path.join(MODEL_DIR, "GFPGANv1.4.pth")
     if not os.path.exists(gfpgan_path):
         print("⬇️  Downloading GFPGANv1.4.pth…")
@@ -36,6 +36,18 @@ def download_models():
         print("✅ GFPGANv1.4.pth downloaded.")
     else:
         print("✅ GFPGANv1.4.pth already present.")
+
+    # 5. Real-ESRGAN x2 — output video upscaling (512→1024)
+    realesrgan_path = os.path.join(MODEL_DIR, "RealESRGAN_x2plus.pth")
+    if not os.path.exists(realesrgan_path):
+        print("⬇️  Downloading RealESRGAN_x2plus.pth…")
+        urllib.request.urlretrieve(
+            "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+            realesrgan_path,
+        )
+        print("✅ RealESRGAN_x2plus.pth downloaded.")
+    else:
+        print("✅ RealESRGAN_x2plus.pth already present.")
 
     print("✅ All models downloaded successfully!")
 

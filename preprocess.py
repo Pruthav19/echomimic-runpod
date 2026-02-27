@@ -185,6 +185,113 @@ def white_balance(img_bgr: np.ndarray) -> np.ndarray:
     return img_f.astype(np.uint8)
 
 
+# ── Step 4: Real-ESRGAN video upscaling ──────────────────────────────────────
+
+REALESRGAN_MODEL_PATH = os.path.join(MODEL_DIR, "RealESRGAN_x2plus.pth")
+_realesrgan_upsampler = None
+
+
+def _get_upsampler():
+    global _realesrgan_upsampler
+    if _realesrgan_upsampler is None:
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        from realesrgan import RealESRGANer
+        logger.info("Loading Real-ESRGAN x2 model (one-time cost)…")
+        model = RRDBNet(
+            num_in_ch=3, num_out_ch=3, num_feat=64,
+            num_block=23, num_grow_ch=32, scale=2,
+        )
+        _realesrgan_upsampler = RealESRGANer(
+            scale=2,
+            model_path=REALESRGAN_MODEL_PATH,
+            model=model,
+            tile=256,        # tile to avoid OOM on large frames
+            tile_pad=16,
+            pre_pad=0,
+            half=True,       # fp16 for speed on CUDA
+        )
+        logger.info("Real-ESRGAN loaded.")
+    return _realesrgan_upsampler
+
+
+def enhance_video(input_video_path: str, output_video_path: str) -> str:
+    """
+    Upscales every frame of *input_video_path* 2× using Real-ESRGAN
+    (512×512 → 1024×1024), then muxes the original audio back via ffmpeg
+    and re-encodes with high-quality H.264 (CRF 16).
+
+    Falls back to copying the original video if the model is missing or
+    any step fails, so inference output is never lost.
+    """
+    import subprocess as sp
+    import shutil
+
+    if not os.path.isfile(REALESRGAN_MODEL_PATH):
+        logger.warning("RealESRGAN model not found — skipping video enhancement.")
+        shutil.copy(input_video_path, output_video_path)
+        return output_video_path
+
+    tmp_video = output_video_path.replace(".mp4", "_noaudio.mp4")
+    try:
+        upsampler = _get_upsampler()
+
+        cap = cv2.VideoCapture(input_video_path)
+        fps        = cap.get(cv2.CAP_PROP_FPS) or 24
+        orig_w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total      = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        out_w, out_h = orig_w * 2, orig_h * 2
+
+        writer = cv2.VideoWriter(
+            tmp_video,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (out_w, out_h),
+        )
+
+        logger.info(f"Upscaling {total} frames {orig_w}×{orig_h} → {out_w}×{out_h}…")
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            enhanced, _ = upsampler.enhance(frame, outscale=2)
+            writer.write(enhanced)
+            idx += 1
+            if idx % 48 == 0:
+                logger.info(f"  {idx}/{total} frames upscaled")
+
+        cap.release()
+        writer.release()
+
+        # Re-encode with libx264 CRF 16 and mux original audio
+        sp.run(
+            [
+                "ffmpeg", "-y",
+                "-i", tmp_video,
+                "-i", input_video_path,
+                "-c:v", "libx264", "-crf", "16", "-preset", "fast",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-shortest",
+                output_video_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        os.remove(tmp_video)
+        logger.info(f"Video enhanced → {output_video_path}")
+        return output_video_path
+
+    except Exception as e:
+        logger.error(f"Video enhancement failed: {e} — using original video.")
+        if os.path.exists(tmp_video):
+            os.remove(tmp_video)
+        shutil.copy(input_video_path, output_video_path)
+        return output_video_path
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def preprocess_image(input_path: str, output_path: str) -> str:
