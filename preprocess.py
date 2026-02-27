@@ -13,12 +13,28 @@ model-load cost on every request inside the same serverless worker process.
 """
 
 import os
+import sys
 import logging
+import types
 
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# ── torchvision compat shim ───────────────────────────────────────────────────
+# torchvision ≥ 0.17 removed `torchvision.transforms.functional_tensor`.
+# basicsr / GFPGAN still import from it; create a proxy module that forwards
+# everything to the current `torchvision.transforms.functional`.
+try:
+    import torchvision.transforms.functional_tensor  # noqa: F401 (exists in old builds)
+except ModuleNotFoundError:
+    import torchvision.transforms.functional as _tvf
+    _proxy = types.ModuleType("torchvision.transforms.functional_tensor")
+    _proxy.__dict__.update(
+        {k: v for k, v in vars(_tvf).items() if not k.startswith("__")}
+    )
+    sys.modules["torchvision.transforms.functional_tensor"] = _proxy
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/runpod-volume/echomimic_models")
 GFPGAN_MODEL_PATH = os.path.join(MODEL_DIR, "GFPGANv1.4.pth")
