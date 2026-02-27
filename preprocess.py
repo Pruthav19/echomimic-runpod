@@ -221,11 +221,15 @@ def _get_face_mesh():
     )
 
 
-# Mediapipe landmark indices for upper/lower eyelid outlines
-_LEFT_EYE_UPPER  = [386, 387, 388, 466, 263]
-_LEFT_EYE_LOWER  = [374, 373, 390, 249, 263]
-_RIGHT_EYE_UPPER = [159, 158, 157, 173, 133]
-_RIGHT_EYE_LOWER = [145, 144, 153, 154, 133]
+# Mediapipe face-mesh landmark indices — full eye contours (468-pt model)
+# Right eye (from viewer's perspective)
+_RIGHT_EYE_ALL   = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+_RIGHT_UPPER_LID = [159, 158, 157, 173, 133, 160, 161]   # upper arc
+_RIGHT_LOWER_LID = [145, 144, 153, 154, 155, 33, 7]      # lower arc
+# Left eye
+_LEFT_EYE_ALL    = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+_LEFT_UPPER_LID  = [386, 385, 384, 398, 362, 387, 388]   # upper arc
+_LEFT_LOWER_LID  = [374, 373, 380, 381, 382, 263, 249]   # lower arc
 
 
 def _blink_schedule(total_frames: int, fps: float, seed: int = 0) -> set:
@@ -249,48 +253,77 @@ def _blink_schedule(total_frames: int, fps: float, seed: int = 0) -> set:
 def _apply_blink(frame: np.ndarray, landmarks, h: int, w: int,
                  t: float) -> np.ndarray:
     """
-    Closes both eyes at blend weight *t* (0=open, 1=fully closed).
-    For each eye: fills the open-eye polygon with skin-tone sampled
-    just below the brow, blended by t.
+    Closes both eyes at weight *t* (0=open, 1=fully closed).
+
+    Technique: slide the *actual upper-eyelid skin texture* downward over
+    the eye region.  At weight t the lid covers t×eye_height pixels from
+    the top of the eye down.  This produces photo-realistic closure with
+    the correct skin tone, wrinkles and lashes of that specific face.
+    A feathered blend mask at the lid edge prevents hard lines.
     """
+    if t <= 0.0:
+        return frame
     frame = frame.copy()
-    for upper_ids, lower_ids in [
-        (_LEFT_EYE_UPPER, _LEFT_EYE_LOWER),
-        (_RIGHT_EYE_UPPER, _RIGHT_EYE_LOWER),
-    ]:
-        pts_upper = np.array(
-            [[int(landmarks[i].x * w), int(landmarks[i].y * h)] for i in upper_ids],
+
+    for all_ids in [_RIGHT_EYE_ALL, _LEFT_EYE_ALL]:
+        pts = np.array(
+            [[int(landmarks[i].x * w), int(landmarks[i].y * h)] for i in all_ids],
             dtype=np.int32,
         )
-        pts_lower = np.array(
-            [[int(landmarks[i].x * w), int(landmarks[i].y * h)] for i in lower_ids],
-            dtype=np.int32,
-        )
-        # Bounding box of the eye for skin sampling
-        all_pts = np.vstack([pts_upper, pts_lower])
-        x1, y1 = all_pts.min(axis=0)
-        x2, y2 = all_pts.max(axis=0)
-        pad = max(2, (y2 - y1) // 3)
-        # Sample skin color just above the eye (brow area)
-        brow_y = max(0, y1 - pad)
-        skin_roi = frame[brow_y:y1, max(0, x1):min(w, x2)]
-        if skin_roi.size == 0:
-            skin_color = np.array([180, 150, 130], dtype=np.uint8)
-        else:
-            skin_color = skin_roi.mean(axis=(0, 1)).astype(np.uint8)
+        x1, y1 = pts.min(axis=0)
+        x2, y2 = pts.max(axis=0)
+        ew = max(x2 - x1, 1)
+        eh = max(y2 - y1, 1)
 
-        # Build a closed-eye mask (filled polygon = eye region)
-        closed_outline = np.vstack([pts_upper, pts_lower[::-1]])
-        mask = np.zeros((h, w), dtype=np.float32)
-        cv2.fillPoly(mask, [closed_outline], 1.0)
+        # ── Source texture: strip of skin directly above the eye ──────────
+        # Use the same height as the eye so a full close maps 1:1.
+        src_y1 = max(0, y1 - eh)
+        src_y2 = y1
+        src_x1 = max(0, x1)
+        src_x2 = min(w, x2)
+        src_w  = src_x2 - src_x1
 
-        # Blend skin color over eye region by weight t
-        for c in range(3):
-            frame[:, :, c] = np.where(
-                mask > 0,
-                (frame[:, :, c] * (1 - t) + skin_color[c] * t).astype(np.uint8),
-                frame[:, :, c],
-            )
+        if src_w <= 0 or (src_y2 - src_y1) <= 0:
+            continue  # safety guard
+
+        lid_texture = frame[src_y1:src_y2, src_x1:src_x2].copy()  # shape (eh, ew)
+
+        # ── How many pixel rows the lid covers this frame ─────────────────
+        cover_rows = int(round(t * eh))
+        if cover_rows <= 0:
+            continue
+
+        # ── Eye contour mask (keeps painting inside the eye opening only) ─
+        eye_mask = np.zeros((h, w), dtype=np.float32)
+        cv2.fillPoly(eye_mask, [pts], 1.0)
+        # Soft feather
+        eye_mask = cv2.GaussianBlur(eye_mask, (5, 5), 0)
+
+        # ── Paste lid texture row-by-row into destination ─────────────────
+        dst_y1 = y1
+        dst_y2 = min(y1 + cover_rows, y2, h)
+        if dst_y2 <= dst_y1:
+            continue
+
+        paste_h = dst_y2 - dst_y1
+        # Scale lid texture to paste_h rows (stretch lid as it closes)
+        block = cv2.resize(lid_texture, (src_w, paste_h),
+                           interpolation=cv2.INTER_LINEAR)
+
+        # Feathered alpha at the bottom edge of the lid (soften lid line)
+        alpha = np.ones((paste_h, src_w, 1), dtype=np.float32)
+        feather = max(2, paste_h // 4)
+        alpha[-feather:] *= np.linspace(1, 0, feather, dtype=np.float32).reshape(-1, 1, 1)
+
+        # Extract eye mask slice
+        em_slice = eye_mask[dst_y1:dst_y2, src_x1:src_x2, np.newaxis]
+        combined_alpha = np.clip(alpha * em_slice, 0, 1)
+
+        orig = frame[dst_y1:dst_y2, src_x1:src_x2].astype(np.float32)
+        blended = (block.astype(np.float32) * combined_alpha
+                   + orig * (1 - combined_alpha)).astype(np.uint8)
+        frame[dst_y1:dst_y2, src_x1:src_x2] = blended
+
     return frame
 
 
@@ -344,18 +377,28 @@ def add_natural_motion(input_video_path: str, output_video_path: str) -> str:
         logger.info(f"Natural motion: {len(raw_frames)} frames @ {fps:.1f} fps")
 
         # ── B. Micro head motion trajectory ─────────────────────────────────
+        n = len(raw_frames)
+        t_axis = np.arange(n) / fps   # time in seconds
         rng = np.random.default_rng(42)
-        raw_dx = np.cumsum(rng.normal(0, 0.6, len(raw_frames)))
-        raw_dy = np.cumsum(rng.normal(0, 0.4, len(raw_frames)))
-        raw_da = np.cumsum(rng.normal(0, 0.05, len(raw_frames)))
-        # Smooth and clamp
-        dx = np.clip(_smooth_trajectory(raw_dx, 12), -4, 4)
-        dy = np.clip(_smooth_trajectory(raw_dy, 12), -3, 3)
-        da = np.clip(_smooth_trajectory(raw_da, 18), -0.4, 0.4)
-        # Drift back toward zero so video doesn't walk off-centre
-        dx -= np.linspace(dx[0], dx[-1], len(raw_frames))
-        dy -= np.linspace(dy[0], dy[-1], len(raw_frames))
-        da -= np.linspace(da[0], da[-1], len(raw_frames))
+
+        # Random organic drift (smoothed cumulative noise)
+        raw_dx = np.cumsum(rng.normal(0, 1.0, n))
+        raw_dy = np.cumsum(rng.normal(0, 0.7, n))
+        raw_da = np.cumsum(rng.normal(0, 0.10, n))
+        dx = np.clip(_smooth_trajectory(raw_dx, 14), -10, 10)
+        dy = np.clip(_smooth_trajectory(raw_dy, 14), -8,   8)
+        da = np.clip(_smooth_trajectory(raw_da, 20), -1.5, 1.5)
+
+        # Add a gentle sinusoidal breathing / head-bob (0.3 Hz ≈ one breath per 3s)
+        breathing = np.sin(2 * np.pi * 0.30 * t_axis) * 2.5   # ±2.5 px vertical
+        side_sway = np.sin(2 * np.pi * 0.18 * t_axis) * 1.5   # ±1.5 px horizontal
+        dy += breathing
+        dx += side_sway
+
+        # Drift back toward zero so video doesn't drift off-centre
+        dx -= np.linspace(dx[0], dx[-1], n)
+        dy -= np.linspace(dy[0], dy[-1], n)
+        da -= np.linspace(da[0], da[-1], n)
 
         cx, cy = width / 2, height / 2
 
@@ -386,7 +429,8 @@ def add_natural_motion(input_video_path: str, output_video_path: str) -> str:
         # Build per-frame blink weight (0=open … 1=closed … 0=open)
         # Shape: 2 frames ramp up, 1 hold, 2 ramp down
         blink_weight = np.zeros(len(raw_frames), dtype=np.float32)
-        blink_curve  = [0.4, 1.0, 1.0, 0.5, 0.1]  # 5-frame blink envelope
+        # 7-frame blink envelope — smooth rise and fall, no hard edges
+        blink_curve  = [0.2, 0.7, 1.0, 1.0, 0.6, 0.2, 0.05]
         for bs in blink_starts:
             for o, w_val in enumerate(blink_curve):
                 if bs + o < len(raw_frames):
