@@ -42,6 +42,35 @@ def upload_to_s3(local_path, s3_key):
     url = s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": s3_key}, ExpiresIn=3600)
     return url
 
+def preprocess_audio(input_path: str, output_path: str) -> str:
+    """
+    Normalise and resample audio to exactly what EchoMimic's Whisper model expects:
+      • Mono (1 channel)
+      • 16 000 Hz sample rate
+      • loudnorm to -14 LUFS (prevents Whisper from being driven by silence or clipping)
+    A bad sample rate / stereo mix / wrong loudness are the main causes of
+    lip-sync drift.
+    """
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", input_path,
+            "-ac", "1",              # mono
+            "-ar", "16000",          # 16 kHz — Whisper's native rate
+            "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",  # broadcast loudness norm
+            "-c:a", "pcm_s16le",     # 16-bit PCM WAV
+            output_path,
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        logger.warning(f"Audio preprocessing failed: {result.stderr} — using original.")
+        import shutil
+        shutil.copy(input_path, output_path)
+    else:
+        logger.info(f"Audio preprocessed: mono 16kHz loudnorm → {output_path}")
+    return output_path
+
+
 def run_echomimic(image_path, audio_path, output_dir, user_params):
     """Dynamically generates a YAML config overriding defaults with API input."""
     
@@ -92,8 +121,10 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
     cfg  = float(user_params.get("cfg_scale",        2.5))  # 2.5 keeps expressions natural; 3.0+ causes stiffness
     fps  = int(user_params.get("fps",                24))
     seed = int(user_params.get("seed",               42))
-    ctx_frames  = int(user_params.get("context_frames",   12))
-    ctx_overlap = int(user_params.get("context_overlap",   3))
+    # context_frames=16 + context_overlap=6: larger window + more overlap
+    # dramatically reduces motion seams and improves expression continuity
+    ctx_frames  = int(user_params.get("context_frames",   16))
+    ctx_overlap = int(user_params.get("context_overlap",   6))
 
     # facecrop_dilation_ratio: how much padding around the face box for the reference crop
     #   0.5 = default (tight); 1.2 = generous shoulder/hair room
@@ -116,6 +147,7 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
         "--seed",   str(seed),
         "--context_frames",        str(ctx_frames),
         "--context_overlap",       str(ctx_overlap),
+        "--sample_rate",           "16000",
         "--facecrop_dilation_ratio", str(facecrop_dilation),
         "--facemusk_dilation_ratio", str(facemask_dilation),
     ]
@@ -152,7 +184,12 @@ def handler(event):
         download_file(input_data["avatar_image_url"], raw_image_path)
         download_file(input_data["audio_url"], audio_path)
 
-        # 1b. Preprocess image for maximum quality
+        # 1b. Preprocess audio: resample to 16kHz mono + loudnorm
+        #     This is the primary fix for lip-sync drift.
+        processed_audio_path = os.path.join(job_dir, "audio_processed.wav")
+        audio_path = preprocess_audio(audio_path, processed_audio_path)
+
+        # 1c. Preprocess image for maximum quality
         #     • Smart portrait crop   → proper talking-head framing
         #     • GFPGAN v1.4 restore   → sharpen/enhance face details (2× upscale)
         #     • White-balance fix     → neutralise colour casts
