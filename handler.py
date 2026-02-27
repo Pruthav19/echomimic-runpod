@@ -211,6 +211,13 @@ def handler(event):
             enhanced_path = os.path.join(job_dir, "output_enhanced.mp4")
             final_video_path = enhance_video(final_video_path, enhanced_path)
 
+        # 2c. Post-process: eye blinks + micro head motion + temporal smooth
+        skip_natural = input_data.get("skip_natural_motion", False)
+        if not skip_natural:
+            from preprocess import add_natural_motion
+            natural_path = os.path.join(job_dir, "output_natural.mp4")
+            final_video_path = add_natural_motion(final_video_path, natural_path)
+
         # 3. Upload to S3
         s3_key = f"echomimic_videos/{job_id}.mp4"
         video_url = upload_to_s3(final_video_path, s3_key)

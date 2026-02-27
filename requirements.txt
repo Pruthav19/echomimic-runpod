@@ -5,3 +5,4 @@ pyyaml>=6.0
 edge-tts>=6.1.0
 huggingface_hub==0.21.3
 gfpgan
+scipy>=1.10.0

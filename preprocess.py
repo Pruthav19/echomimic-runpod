@@ -185,7 +185,280 @@ def white_balance(img_bgr: np.ndarray) -> np.ndarray:
     return img_f.astype(np.uint8)
 
 
-# ── Step 4: Real-ESRGAN video upscaling ──────────────────────────────────────
+# ── Step 4: Natural motion synthesis ─────────────────────────────────────────
+# Three sub-steps applied to the generated video before upscaling:
+#   A. Eye blink injection  – mediapipe face_mesh locates the eyelids;
+#                             blinks fire at natural Poisson intervals (~4s).
+#   B. Micro head motion    – smooth random-walk affine warp (±4 px, ±0.4°).
+#   C. Face temporal smooth – 3-frame weighted blend on the face region only,
+#                             removes diffusion-noise flicker.
+
+def _get_face_mesh():
+    """Lazy mediapipe FaceMesh singleton."""
+    import mediapipe as mp
+    return mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+
+
+# Mediapipe landmark indices for upper/lower eyelid outlines
+_LEFT_EYE_UPPER  = [386, 387, 388, 466, 263]
+_LEFT_EYE_LOWER  = [374, 373, 390, 249, 263]
+_RIGHT_EYE_UPPER = [159, 158, 157, 173, 133]
+_RIGHT_EYE_LOWER = [145, 144, 153, 154, 133]
+
+
+def _blink_schedule(total_frames: int, fps: float, seed: int = 0) -> set:
+    """
+    Returns a set of frame indices where a blink starts.
+    Blinks follow a Poisson process with mean interval 4 s.
+    Each blink occupies 5 frames: 2 close + 1 hold + 2 open.
+    """
+    rng = np.random.default_rng(seed)
+    avg_interval = int(fps * 4)   # ~4 seconds between blinks
+    frames = set()
+    f = avg_interval // 2         # first blink not at frame 0
+    while f < total_frames - 6:
+        frames.add(f)
+        # Poisson interval: exponential inter-arrival
+        interval = max(int(fps * 2), int(rng.exponential(avg_interval)))
+        f += interval
+    return frames
+
+
+def _apply_blink(frame: np.ndarray, landmarks, h: int, w: int,
+                 t: float) -> np.ndarray:
+    """
+    Closes both eyes at blend weight *t* (0=open, 1=fully closed).
+    For each eye: fills the open-eye polygon with skin-tone sampled
+    just below the brow, blended by t.
+    """
+    frame = frame.copy()
+    for upper_ids, lower_ids in [
+        (_LEFT_EYE_UPPER, _LEFT_EYE_LOWER),
+        (_RIGHT_EYE_UPPER, _RIGHT_EYE_LOWER),
+    ]:
+        pts_upper = np.array(
+            [[int(landmarks[i].x * w), int(landmarks[i].y * h)] for i in upper_ids],
+            dtype=np.int32,
+        )
+        pts_lower = np.array(
+            [[int(landmarks[i].x * w), int(landmarks[i].y * h)] for i in lower_ids],
+            dtype=np.int32,
+        )
+        # Bounding box of the eye for skin sampling
+        all_pts = np.vstack([pts_upper, pts_lower])
+        x1, y1 = all_pts.min(axis=0)
+        x2, y2 = all_pts.max(axis=0)
+        pad = max(2, (y2 - y1) // 3)
+        # Sample skin color just above the eye (brow area)
+        brow_y = max(0, y1 - pad)
+        skin_roi = frame[brow_y:y1, max(0, x1):min(w, x2)]
+        if skin_roi.size == 0:
+            skin_color = np.array([180, 150, 130], dtype=np.uint8)
+        else:
+            skin_color = skin_roi.mean(axis=(0, 1)).astype(np.uint8)
+
+        # Build a closed-eye mask (filled polygon = eye region)
+        closed_outline = np.vstack([pts_upper, pts_lower[::-1]])
+        mask = np.zeros((h, w), dtype=np.float32)
+        cv2.fillPoly(mask, [closed_outline], 1.0)
+
+        # Blend skin color over eye region by weight t
+        for c in range(3):
+            frame[:, :, c] = np.where(
+                mask > 0,
+                (frame[:, :, c] * (1 - t) + skin_color[c] * t).astype(np.uint8),
+                frame[:, :, c],
+            )
+    return frame
+
+
+def _smooth_trajectory(values: np.ndarray, sigma: float = 8.0) -> np.ndarray:
+    """Gaussian-smooth a 1D trajectory."""
+    from scipy.ndimage import gaussian_filter1d
+    return gaussian_filter1d(values, sigma=sigma)
+
+
+def add_natural_motion(input_video_path: str, output_video_path: str) -> str:
+    """
+    Post-processing pass that makes the generated video feel more natural:
+
+      A. Eye blinks   – synthesised every ~4 s via mediapipe face landmarks.
+      B. Micro motion – smooth random-walk head sway (±4 px, ±0.4°).
+      C. Face smooth  – light 3-frame temporal blend on the face ROI
+                        to remove diffusion-model flicker.
+
+    Falls back to copying the original if mediapipe is unavailable or any
+    step fails.
+    """
+    import shutil
+    import subprocess as sp
+
+    try:
+        import mediapipe as mp
+        from scipy.ndimage import gaussian_filter1d
+    except ImportError as e:
+        logger.warning(f"add_natural_motion: missing dependency ({e}) — skipping.")
+        shutil.copy(input_video_path, output_video_path)
+        return output_video_path
+
+    try:
+        cap = cv2.VideoCapture(input_video_path)
+        fps    = cap.get(cv2.CAP_PROP_FPS) or 24.0
+        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # ── Read all frames into memory (videos are short, typically <30s) ──
+        raw_frames = []
+        while True:
+            ret, f = cap.read()
+            if not ret:
+                break
+            raw_frames.append(f)
+        cap.release()
+        if not raw_frames:
+            raise RuntimeError("Could not read any frames.")
+
+        logger.info(f"Natural motion: {len(raw_frames)} frames @ {fps:.1f} fps")
+
+        # ── B. Micro head motion trajectory ─────────────────────────────────
+        rng = np.random.default_rng(42)
+        raw_dx = np.cumsum(rng.normal(0, 0.6, len(raw_frames)))
+        raw_dy = np.cumsum(rng.normal(0, 0.4, len(raw_frames)))
+        raw_da = np.cumsum(rng.normal(0, 0.05, len(raw_frames)))
+        # Smooth and clamp
+        dx = np.clip(_smooth_trajectory(raw_dx, 12), -4, 4)
+        dy = np.clip(_smooth_trajectory(raw_dy, 12), -3, 3)
+        da = np.clip(_smooth_trajectory(raw_da, 18), -0.4, 0.4)
+        # Drift back toward zero so video doesn't walk off-centre
+        dx -= np.linspace(dx[0], dx[-1], len(raw_frames))
+        dy -= np.linspace(dy[0], dy[-1], len(raw_frames))
+        da -= np.linspace(da[0], da[-1], len(raw_frames))
+
+        cx, cy = width / 2, height / 2
+
+        # ── Detect face ROI and landmarks on first frame for blink & smooth ─
+        mesh = _get_face_mesh()
+        first_rgb = cv2.cvtColor(raw_frames[0], cv2.COLOR_BGR2RGB)
+        mesh_result = mesh.process(first_rgb)
+
+        has_landmarks = (
+            mesh_result.multi_face_landmarks is not None
+            and len(mesh_result.multi_face_landmarks) > 0
+        )
+        lm0 = mesh_result.multi_face_landmarks[0].landmark if has_landmarks else None
+
+        # Face bounding box from first-frame landmarks (for temporal smooth ROI)
+        if has_landmarks:
+            xs = [int(l.x * width)  for l in lm0]
+            ys = [int(l.y * height) for l in lm0]
+            face_x1 = max(0, min(xs) - 20)
+            face_y1 = max(0, min(ys) - 20)
+            face_x2 = min(width,  max(xs) + 20)
+            face_y2 = min(height, max(ys) + 20)
+        else:
+            face_x1, face_y1, face_x2, face_y2 = 0, 0, width, height
+
+        # ── A. Blink schedule ────────────────────────────────────────────────
+        blink_starts = _blink_schedule(len(raw_frames), fps, seed=42)
+        # Build per-frame blink weight (0=open … 1=closed … 0=open)
+        # Shape: 2 frames ramp up, 1 hold, 2 ramp down
+        blink_weight = np.zeros(len(raw_frames), dtype=np.float32)
+        blink_curve  = [0.4, 1.0, 1.0, 0.5, 0.1]  # 5-frame blink envelope
+        for bs in blink_starts:
+            for o, w_val in enumerate(blink_curve):
+                if bs + o < len(raw_frames):
+                    blink_weight[bs + o] = max(blink_weight[bs + o], w_val)
+
+        # ── Process frames ───────────────────────────────────────────────────
+        processed = []
+        for i, frame in enumerate(raw_frames):
+            f = frame.copy()
+
+            # C. Temporal face-region smooth (3-frame blend, avoid first/last)
+            if 1 <= i <= len(raw_frames) - 2:
+                prev_f = raw_frames[i - 1]
+                next_f = raw_frames[i + 1]
+                blended = (
+                    0.15 * prev_f.astype(np.float32)
+                    + 0.70 * f.astype(np.float32)
+                    + 0.15 * next_f.astype(np.float32)
+                ).astype(np.uint8)
+                # Apply blend only within face ROI
+                f[face_y1:face_y2, face_x1:face_x2] = \
+                    blended[face_y1:face_y2, face_x1:face_x2]
+
+            # A. Eye blink
+            if has_landmarks and blink_weight[i] > 0.01:
+                # Re-detect landmarks for this frame for accuracy
+                rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+                res = mesh.process(rgb)
+                if res.multi_face_landmarks:
+                    lm = res.multi_face_landmarks[0].landmark
+                    f = _apply_blink(f, lm, height, width, float(blink_weight[i]))
+
+            # B. Micro head motion (affine warp)
+            angle  = float(da[i])
+            tx, ty = float(dx[i]), float(dy[i])
+            M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+            M[0, 2] += tx
+            M[1, 2] += ty
+            f = cv2.warpAffine(
+                f, M, (width, height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+
+            processed.append(f)
+
+        mesh.close()
+
+        # ── Write processed frames to temp file then mux audio ───────────────
+        tmp_path = output_video_path.replace(".mp4", "_nat_noaudio.mp4")
+        writer = cv2.VideoWriter(
+            tmp_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+        for f in processed:
+            writer.write(f)
+        writer.release()
+
+        sp.run(
+            [
+                "ffmpeg", "-y",
+                "-i", tmp_path,
+                "-i", input_video_path,
+                "-c:v", "libx264", "-crf", "15", "-preset", "fast",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-shortest",
+                output_video_path,
+            ],
+            check=True, capture_output=True,
+        )
+        os.remove(tmp_path)
+        logger.info(f"Natural motion applied → {output_video_path}")
+        return output_video_path
+
+    except Exception as e:
+        logger.error(f"add_natural_motion failed: {e} — using original video.")
+        if os.path.exists(output_video_path.replace(".mp4", "_nat_noaudio.mp4")):
+            os.remove(output_video_path.replace(".mp4", "_nat_noaudio.mp4"))
+        shutil.copy(input_video_path, output_video_path)
+        return output_video_path
+
+
+# ── Step 5: Real-ESRGAN video upscaling ──────────────────────────────────────
+
 
 REALESRGAN_MODEL_PATH = os.path.join(MODEL_DIR, "RealESRGAN_x2plus.pth")
 _realesrgan_upsampler = None
