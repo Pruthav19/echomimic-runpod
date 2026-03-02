@@ -118,7 +118,7 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
     w    = int(user_params.get("target_size",       512))
     h    = int(user_params.get("target_size",       512))
     steps = int(user_params.get("inference_steps",   40))
-    cfg  = float(user_params.get("cfg_scale",        2.5))  # 2.5 keeps expressions natural; 3.0+ causes stiffness
+    cfg  = float(user_params.get("cfg_scale",        3.5))  # 3.5 drives stronger audio conditioning → fuller lip sync + expression
     fps  = int(user_params.get("fps",                24))
     seed = int(user_params.get("seed",               42))
     # context_frames=16 + context_overlap=6: larger window + more overlap
@@ -131,10 +131,10 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
     facecrop_dilation = float(user_params.get("face_expand_ratio",    0.5))
 
     # facemusk_dilation_ratio: padding around the face bbox for the animated mask.
-    #   The EchoMimic source is already patched to start the mask from nose level,
-    #   so 0.0 here means zero extra padding beyond that lower-face region.
-    #   Increase slightly (e.g. 0.05) only if mouth corners feel clipped.
-    facemask_dilation = float(user_params.get("face_mask_dilation",   0.0))
+    #   The EchoMimic source is already patched to start the mask from nose level.
+    #   0.1 adds slight padding beyond the face bbox so mouth corners
+    #   and cheek movements aren't clipped at the mask boundary.
+    facemask_dilation = float(user_params.get("face_mask_dilation",   0.1))
 
     cmd = [
         "python", "-u", "infer_audio2vid.py",
@@ -204,19 +204,20 @@ def handler(event):
         # 2. Run Generation
         final_video_path = run_echomimic(image_path, audio_path, job_dir, input_data)
 
-        # 2b. Post-process: Real-ESRGAN 2× upscale (512→1024) + H.264 CRF 16
-        skip_enhance = input_data.get("skip_enhance", False)
-        if not skip_enhance:
-            from preprocess import enhance_video
-            enhanced_path = os.path.join(job_dir, "output_enhanced.mp4")
-            final_video_path = enhance_video(final_video_path, enhanced_path)
-
-        # 2c. Post-process: eye blinks + micro head motion + temporal smooth
+        # 2b. Post-process: eye blinks + micro head motion (at native 512 res)
+        #     Applied BEFORE upscaling so Real-ESRGAN can polish any artefacts.
         skip_natural = input_data.get("skip_natural_motion", False)
         if not skip_natural:
             from preprocess import add_natural_motion
             natural_path = os.path.join(job_dir, "output_natural.mp4")
             final_video_path = add_natural_motion(final_video_path, natural_path)
+
+        # 2c. Post-process: Real-ESRGAN 2× upscale (512→1024) + H.264 CRF 16
+        skip_enhance = input_data.get("skip_enhance", False)
+        if not skip_enhance:
+            from preprocess import enhance_video
+            enhanced_path = os.path.join(job_dir, "output_enhanced.mp4")
+            final_video_path = enhance_video(final_video_path, enhanced_path)
 
         # 3. Upload to S3
         s3_key = f"echomimic_videos/{job_id}.mp4"

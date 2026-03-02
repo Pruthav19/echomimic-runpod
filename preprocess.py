@@ -441,18 +441,7 @@ def add_natural_motion(input_video_path: str, output_video_path: str) -> str:
         for i, frame in enumerate(raw_frames):
             f = frame.copy()
 
-            # C. Temporal face-region smooth (3-frame blend, avoid first/last)
-            if 1 <= i <= len(raw_frames) - 2:
-                prev_f = raw_frames[i - 1]
-                next_f = raw_frames[i + 1]
-                blended = (
-                    0.15 * prev_f.astype(np.float32)
-                    + 0.70 * f.astype(np.float32)
-                    + 0.15 * next_f.astype(np.float32)
-                ).astype(np.uint8)
-                # Apply blend only within face ROI
-                f[face_y1:face_y2, face_x1:face_x2] = \
-                    blended[face_y1:face_y2, face_x1:face_x2]
+            # (Temporal face smoothing removed — it was the primary blur source)
 
             # A. Eye blink
             if has_landmarks and blink_weight[i] > 0.01:
@@ -649,6 +638,12 @@ def preprocess_image(input_path: str, output_path: str) -> str:
 
     # 2. GFPGAN restoration (also upscales 2×)
     img = restore_face(img)
+
+    # 2b. Sharpening pass — counteracts GFPGAN's slight softness
+    #     Unsharp mask: subtract a blurred copy to boost high-frequency detail
+    blurred = cv2.GaussianBlur(img, (0, 0), sigmaX=2.0)
+    img = cv2.addWeighted(img, 1.4, blurred, -0.4, 0)
+    img = np.clip(img, 0, 255).astype(np.uint8)
 
     # 3. White balance
     img = white_balance(img)
