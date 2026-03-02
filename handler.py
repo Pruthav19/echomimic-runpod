@@ -204,7 +204,7 @@ def handler(event):
         # 2. Run Generation
         final_video_path = run_echomimic(image_path, audio_path, job_dir, input_data)
 
-        # 2b. Post-process: eye blinks + micro head motion (at native 512 res)
+        # 2b. Post-process: organic head motion (at native 512 res)
         #     Applied BEFORE upscaling so Real-ESRGAN can polish any artefacts.
         skip_natural = input_data.get("skip_natural_motion", False)
         if not skip_natural:

@@ -201,158 +201,36 @@ def white_balance(img_bgr: np.ndarray) -> np.ndarray:
     return img_f.astype(np.uint8)
 
 
-# ── Step 4: Natural motion synthesis ─────────────────────────────────────────
-# Three sub-steps applied to the generated video before upscaling:
-#   A. Eye blink injection  – mediapipe face_mesh locates the eyelids;
-#                             blinks fire at natural Poisson intervals (~4s).
-#   B. Micro head motion    – smooth random-walk affine warp (±4 px, ±0.4°).
-#   C. Face temporal smooth – 3-frame weighted blend on the face region only,
-#                             removes diffusion-noise flicker.
-
-def _get_face_mesh():
-    """Lazy mediapipe FaceMesh singleton."""
-    import mediapipe as mp
-    return mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-
-
-# Mediapipe face-mesh landmark indices — full eye contours (468-pt model)
-# Right eye (from viewer's perspective)
-_RIGHT_EYE_ALL   = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
-_RIGHT_UPPER_LID = [159, 158, 157, 173, 133, 160, 161]   # upper arc
-_RIGHT_LOWER_LID = [145, 144, 153, 154, 155, 33, 7]      # lower arc
-# Left eye
-_LEFT_EYE_ALL    = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
-_LEFT_UPPER_LID  = [386, 385, 384, 398, 362, 387, 388]   # upper arc
-_LEFT_LOWER_LID  = [374, 373, 380, 381, 382, 263, 249]   # lower arc
-
-
-def _blink_schedule(total_frames: int, fps: float, seed: int = 0) -> set:
-    """
-    Returns a set of frame indices where a blink starts.
-    Blinks follow a Poisson process with mean interval 4 s.
-    Each blink occupies 5 frames: 2 close + 1 hold + 2 open.
-    """
-    rng = np.random.default_rng(seed)
-    avg_interval = int(fps * 4)   # ~4 seconds between blinks
-    frames = set()
-    f = avg_interval // 2         # first blink not at frame 0
-    while f < total_frames - 6:
-        frames.add(f)
-        # Poisson interval: exponential inter-arrival
-        interval = max(int(fps * 2), int(rng.exponential(avg_interval)))
-        f += interval
-    return frames
-
-
-def _apply_blink(frame: np.ndarray, landmarks, h: int, w: int,
-                 t: float) -> np.ndarray:
-    """
-    Closes both eyes at weight *t* (0=open, 1=fully closed).
-
-    Technique: slide the *actual upper-eyelid skin texture* downward over
-    the eye region.  At weight t the lid covers t×eye_height pixels from
-    the top of the eye down.  This produces photo-realistic closure with
-    the correct skin tone, wrinkles and lashes of that specific face.
-    A feathered blend mask at the lid edge prevents hard lines.
-    """
-    if t <= 0.0:
-        return frame
-    frame = frame.copy()
-
-    for all_ids in [_RIGHT_EYE_ALL, _LEFT_EYE_ALL]:
-        pts = np.array(
-            [[int(landmarks[i].x * w), int(landmarks[i].y * h)] for i in all_ids],
-            dtype=np.int32,
-        )
-        x1, y1 = pts.min(axis=0)
-        x2, y2 = pts.max(axis=0)
-        ew = max(x2 - x1, 1)
-        eh = max(y2 - y1, 1)
-
-        # ── Source texture: strip of skin directly above the eye ──────────
-        # Use the same height as the eye so a full close maps 1:1.
-        src_y1 = max(0, y1 - eh)
-        src_y2 = y1
-        src_x1 = max(0, x1)
-        src_x2 = min(w, x2)
-        src_w  = src_x2 - src_x1
-
-        if src_w <= 0 or (src_y2 - src_y1) <= 0:
-            continue  # safety guard
-
-        lid_texture = frame[src_y1:src_y2, src_x1:src_x2].copy()  # shape (eh, ew)
-
-        # ── How many pixel rows the lid covers this frame ─────────────────
-        cover_rows = int(round(t * eh))
-        if cover_rows <= 0:
-            continue
-
-        # ── Eye contour mask (keeps painting inside the eye opening only) ─
-        eye_mask = np.zeros((h, w), dtype=np.float32)
-        cv2.fillPoly(eye_mask, [pts], 1.0)
-        # Soft feather
-        eye_mask = cv2.GaussianBlur(eye_mask, (5, 5), 0)
-
-        # ── Paste lid texture row-by-row into destination ─────────────────
-        dst_y1 = y1
-        dst_y2 = min(y1 + cover_rows, y2, h)
-        if dst_y2 <= dst_y1:
-            continue
-
-        paste_h = dst_y2 - dst_y1
-        # Scale lid texture to paste_h rows (stretch lid as it closes)
-        block = cv2.resize(lid_texture, (src_w, paste_h),
-                           interpolation=cv2.INTER_LINEAR)
-
-        # Feathered alpha at the bottom edge of the lid (soften lid line)
-        alpha = np.ones((paste_h, src_w, 1), dtype=np.float32)
-        feather = max(2, paste_h // 4)
-        alpha[-feather:] *= np.linspace(1, 0, feather, dtype=np.float32).reshape(-1, 1, 1)
-
-        # Extract eye mask slice
-        em_slice = eye_mask[dst_y1:dst_y2, src_x1:src_x2, np.newaxis]
-        combined_alpha = np.clip(alpha * em_slice, 0, 1)
-
-        orig = frame[dst_y1:dst_y2, src_x1:src_x2].astype(np.float32)
-        blended = (block.astype(np.float32) * combined_alpha
-                   + orig * (1 - combined_alpha)).astype(np.uint8)
-        frame[dst_y1:dst_y2, src_x1:src_x2] = blended
-
-    return frame
-
-
-def _smooth_trajectory(values: np.ndarray, sigma: float = 8.0) -> np.ndarray:
-    """Gaussian-smooth a 1D trajectory."""
-    from scipy.ndimage import gaussian_filter1d
-    return gaussian_filter1d(values, sigma=sigma)
+# ── Step 4: Natural head motion synthesis ─────────────────────────────────────
+# Adds organic head micro-motion (drift, breathing, sway, scale pulse)
+# so the avatar doesn't look like a static image with a moving mouth.
+# Eye blinks and facial expressions are handled by EchoMimic itself
+# (the face mask now includes the full face region).
 
 
 def add_natural_motion(input_video_path: str, output_video_path: str) -> str:
     """
-    Post-processing pass that makes the generated video feel more natural:
+    Post-processing pass: adds organic head micro-motion so the avatar
+    doesn't look like a static image with a moving mouth.
 
-      A. Eye blinks   – synthesised every ~4 s via mediapipe face landmarks.
-      B. Micro motion – smooth random-walk head sway (±4 px, ±0.4°).
-      C. Face smooth  – light 3-frame temporal blend on the face ROI
-                        to remove diffusion-model flicker.
+    Components:
+      - Gaussian random-walk drift  (±12 px, ±2°) for organic head sway
+      - Sinusoidal breathing bob     (0.3 Hz, ±3 px vertical)
+      - Sinusoidal side-sway         (0.18 Hz, ±2 px horizontal)
+      - Slight periodic scale pulse  (0.25 Hz, ±0.5%) for breathing depth
 
-    Falls back to copying the original if mediapipe is unavailable or any
-    step fails.
+    Eye blinks and facial expressions are now handled by EchoMimic itself
+    (the face mask includes the full face region).
+
+    Falls back to copying the original if any step fails.
     """
     import shutil
     import subprocess as sp
 
     try:
-        import mediapipe as mp
         from scipy.ndimage import gaussian_filter1d
     except ImportError as e:
-        logger.warning(f"add_natural_motion: missing dependency ({e}) — skipping.")
+        logger.warning(f"add_natural_motion: scipy missing ({e}) — skipping.")
         shutil.copy(input_video_path, output_video_path)
         return output_video_path
 
@@ -361,9 +239,7 @@ def add_natural_motion(input_video_path: str, output_video_path: str) -> str:
         fps    = cap.get(cv2.CAP_PROP_FPS) or 24.0
         width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # ── Read all frames into memory (videos are short, typically <30s) ──
         raw_frames = []
         while True:
             ret, f = cap.read()
@@ -374,101 +250,56 @@ def add_natural_motion(input_video_path: str, output_video_path: str) -> str:
         if not raw_frames:
             raise RuntimeError("Could not read any frames.")
 
-        logger.info(f"Natural motion: {len(raw_frames)} frames @ {fps:.1f} fps")
-
-        # ── B. Micro head motion trajectory ─────────────────────────────────
         n = len(raw_frames)
-        t_axis = np.arange(n) / fps   # time in seconds
+        logger.info(f"Natural motion: {n} frames @ {fps:.1f} fps")
+
+        t_axis = np.arange(n) / fps  # seconds
         rng = np.random.default_rng(42)
 
-        # Random organic drift (smoothed cumulative noise)
-        raw_dx = np.cumsum(rng.normal(0, 1.0, n))
-        raw_dy = np.cumsum(rng.normal(0, 0.7, n))
-        raw_da = np.cumsum(rng.normal(0, 0.10, n))
-        dx = np.clip(_smooth_trajectory(raw_dx, 14), -10, 10)
-        dy = np.clip(_smooth_trajectory(raw_dy, 14), -8,   8)
-        da = np.clip(_smooth_trajectory(raw_da, 20), -1.5, 1.5)
+        # ── Random organic drift ─────────────────────────────────────────
+        raw_dx = np.cumsum(rng.normal(0, 1.2, n))
+        raw_dy = np.cumsum(rng.normal(0, 0.9, n))
+        raw_da = np.cumsum(rng.normal(0, 0.14, n))  # degrees
+        dx = np.clip(gaussian_filter1d(raw_dx, sigma=16), -12, 12)
+        dy = np.clip(gaussian_filter1d(raw_dy, sigma=16), -10, 10)
+        da = np.clip(gaussian_filter1d(raw_da, sigma=22), -2.0, 2.0)
 
-        # Add a gentle sinusoidal breathing / head-bob (0.3 Hz ≈ one breath per 3s)
-        breathing = np.sin(2 * np.pi * 0.30 * t_axis) * 2.5   # ±2.5 px vertical
-        side_sway = np.sin(2 * np.pi * 0.18 * t_axis) * 1.5   # ±1.5 px horizontal
+        # ── Periodic components ──────────────────────────────────────────
+        # Breathing head-bob
+        breathing = np.sin(2 * np.pi * 0.30 * t_axis) * 3.0   # ±3 px vertical
+        # Gentle side-to-side sway (different frequency → organic feel)
+        sway      = np.sin(2 * np.pi * 0.18 * t_axis) * 2.0   # ±2 px horizontal
+        # Micro-nod (very slow)
+        nod       = np.sin(2 * np.pi * 0.12 * t_axis) * 0.6   # ±0.6° rotation
+        # Breathing scale pulse (chest/shoulder rise)
+        scale_pulse = 1.0 + np.sin(2 * np.pi * 0.25 * t_axis) * 0.004  # ±0.4%
+
         dy += breathing
-        dx += side_sway
+        dx += sway
+        da += nod
 
-        # Drift back toward zero so video doesn't drift off-centre
+        # Return to zero so video doesn't walk off-centre
         dx -= np.linspace(dx[0], dx[-1], n)
         dy -= np.linspace(dy[0], dy[-1], n)
         da -= np.linspace(da[0], da[-1], n)
 
-        cx, cy = width / 2, height / 2
+        cx, cy = width / 2.0, height / 2.0
 
-        # ── Detect face ROI and landmarks on first frame for blink & smooth ─
-        mesh = _get_face_mesh()
-        first_rgb = cv2.cvtColor(raw_frames[0], cv2.COLOR_BGR2RGB)
-        mesh_result = mesh.process(first_rgb)
-
-        has_landmarks = (
-            mesh_result.multi_face_landmarks is not None
-            and len(mesh_result.multi_face_landmarks) > 0
-        )
-        lm0 = mesh_result.multi_face_landmarks[0].landmark if has_landmarks else None
-
-        # Face bounding box from first-frame landmarks (for temporal smooth ROI)
-        if has_landmarks:
-            xs = [int(l.x * width)  for l in lm0]
-            ys = [int(l.y * height) for l in lm0]
-            face_x1 = max(0, min(xs) - 20)
-            face_y1 = max(0, min(ys) - 20)
-            face_x2 = min(width,  max(xs) + 20)
-            face_y2 = min(height, max(ys) + 20)
-        else:
-            face_x1, face_y1, face_x2, face_y2 = 0, 0, width, height
-
-        # ── A. Blink schedule ────────────────────────────────────────────────
-        blink_starts = _blink_schedule(len(raw_frames), fps, seed=42)
-        # Build per-frame blink weight (0=open … 1=closed … 0=open)
-        # Shape: 2 frames ramp up, 1 hold, 2 ramp down
-        blink_weight = np.zeros(len(raw_frames), dtype=np.float32)
-        # 7-frame blink envelope — smooth rise and fall, no hard edges
-        blink_curve  = [0.2, 0.7, 1.0, 1.0, 0.6, 0.2, 0.05]
-        for bs in blink_starts:
-            for o, w_val in enumerate(blink_curve):
-                if bs + o < len(raw_frames):
-                    blink_weight[bs + o] = max(blink_weight[bs + o], w_val)
-
-        # ── Process frames ───────────────────────────────────────────────────
+        # ── Apply per-frame warp ─────────────────────────────────────────
         processed = []
         for i, frame in enumerate(raw_frames):
-            f = frame.copy()
-
-            # (Temporal face smoothing removed — it was the primary blur source)
-
-            # A. Eye blink
-            if has_landmarks and blink_weight[i] > 0.01:
-                # Re-detect landmarks for this frame for accuracy
-                rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
-                res = mesh.process(rgb)
-                if res.multi_face_landmarks:
-                    lm = res.multi_face_landmarks[0].landmark
-                    f = _apply_blink(f, lm, height, width, float(blink_weight[i]))
-
-            # B. Micro head motion (affine warp)
-            angle  = float(da[i])
-            tx, ty = float(dx[i]), float(dy[i])
-            M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
-            M[0, 2] += tx
-            M[1, 2] += ty
+            s = float(scale_pulse[i])
+            M = cv2.getRotationMatrix2D((cx, cy), float(da[i]), s)
+            M[0, 2] += float(dx[i])
+            M[1, 2] += float(dy[i])
             f = cv2.warpAffine(
-                f, M, (width, height),
+                frame, M, (width, height),
                 flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_REPLICATE,
             )
-
             processed.append(f)
 
-        mesh.close()
-
-        # ── Write processed frames to temp file then mux audio ───────────────
+        # ── Write frames then mux original audio ────────────────────────
         tmp_path = output_video_path.replace(".mp4", "_nat_noaudio.mp4")
         writer = cv2.VideoWriter(
             tmp_path,
