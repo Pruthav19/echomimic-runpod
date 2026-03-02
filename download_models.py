@@ -23,7 +23,25 @@ def download_models():
     )
 
     # 3. Stable Diffusion VAE
-    snapshot_download(repo_id="stabilityai/sd-vae-ft-mse", local_dir=os.path.join(MODEL_DIR, "sd-vae-ft-mse"))
+    #    Diffusers' AutoencoderKL.from_pretrained() needs either
+    #    diffusion_pytorch_model.bin or diffusion_pytorch_model.safetensors.
+    #    Newer HF Hub versions may download only safetensors; we handle both.
+    vae_dir = os.path.join(MODEL_DIR, "sd-vae-ft-mse")
+    snapshot_download(
+        repo_id="stabilityai/sd-vae-ft-mse",
+        local_dir=vae_dir,
+    )
+    # Verify at least one weight file landed
+    has_bin  = os.path.isfile(os.path.join(vae_dir, "diffusion_pytorch_model.bin"))
+    has_safe = os.path.isfile(os.path.join(vae_dir, "diffusion_pytorch_model.safetensors"))
+    if not has_bin and not has_safe:
+        print("⚠️  VAE weights missing after snapshot_download — retrying with allow_patterns…")
+        snapshot_download(
+            repo_id="stabilityai/sd-vae-ft-mse",
+            local_dir=vae_dir,
+            allow_patterns=["*.bin", "*.json", "*.safetensors"],
+        )
+    print(f"✅ sd-vae-ft-mse downloaded (bin={has_bin}, safetensors={has_safe}).")
 
     # 4. GFPGAN v1.4 — face restoration weights (input image enhancement)
     gfpgan_path = os.path.join(MODEL_DIR, "GFPGANv1.4.pth")
