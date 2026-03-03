@@ -337,7 +337,110 @@ def add_natural_motion(input_video_path: str, output_video_path: str) -> str:
         return output_video_path
 
 
-# ── Step 5: Real-ESRGAN video upscaling ──────────────────────────────────────
+# ── Step 5: GFPGAN video face restoration + upscale ──────────────────────────
+# Applies GFPGAN to every frame of the output video.
+# This fixes teeth artefacts, sharpens eyes/skin, and upscales 2× (512→1024)
+# all in one pass — better face quality than Real-ESRGAN alone.
+
+
+def restore_video_faces(input_video_path: str, output_video_path: str) -> str:
+    """
+    Runs GFPGAN face restoration on every frame of the video.
+    - Fixes diffusion-model artefacts (teeth, eye detail, skin texture)
+    - Upscales 2× (512→1024) via GFPGAN's built-in super-resolution
+    - Muxes original audio back via ffmpeg
+
+    Falls back to input video on any error.
+    """
+    import subprocess as sp
+    import shutil
+
+    if not os.path.isfile(GFPGAN_MODEL_PATH):
+        logger.warning("GFPGAN model not found — skipping video face restoration.")
+        shutil.copy(input_video_path, output_video_path)
+        return output_video_path
+
+    tmp_video = output_video_path.replace(".mp4", "_gfpgan_noaudio.mp4")
+    try:
+        restorer = _get_restorer()
+
+        cap = cv2.VideoCapture(input_video_path)
+        fps    = cap.get(cv2.CAP_PROP_FPS) or 24
+        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # GFPGAN upscales 2× internally
+        out_w, out_h = orig_w * 2, orig_h * 2
+
+        writer = cv2.VideoWriter(
+            tmp_video,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (out_w, out_h),
+        )
+
+        logger.info(f"GFPGAN video restore: {total} frames {orig_w}×{orig_h} → {out_w}×{out_h}")
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            try:
+                _, _, restored = restorer.enhance(
+                    frame,
+                    has_aligned=False,
+                    only_center_face=True,
+                    paste_back=True,
+                )
+                if restored is not None:
+                    # Ensure output matches expected dimensions
+                    if restored.shape[:2] != (out_h, out_w):
+                        restored = cv2.resize(restored, (out_w, out_h),
+                                              interpolation=cv2.INTER_LANCZOS4)
+                    writer.write(restored)
+                else:
+                    # Fallback: simple upscale
+                    writer.write(cv2.resize(frame, (out_w, out_h),
+                                            interpolation=cv2.INTER_LANCZOS4))
+            except Exception:
+                writer.write(cv2.resize(frame, (out_w, out_h),
+                                        interpolation=cv2.INTER_LANCZOS4))
+            idx += 1
+            if idx % 48 == 0:
+                logger.info(f"  {idx}/{total} frames restored")
+
+        cap.release()
+        writer.release()
+
+        # Re-encode with libx264 + mux original audio
+        sp.run(
+            [
+                "ffmpeg", "-y",
+                "-i", tmp_video,
+                "-i", input_video_path,
+                "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-shortest",
+                output_video_path,
+            ],
+            check=True, capture_output=True,
+        )
+        os.remove(tmp_video)
+        logger.info(f"GFPGAN video restored → {output_video_path}")
+        return output_video_path
+
+    except Exception as e:
+        logger.error(f"GFPGAN video restoration failed: {e} — using original.")
+        if os.path.exists(tmp_video):
+            os.remove(tmp_video)
+        shutil.copy(input_video_path, output_video_path)
+        return output_video_path
+
+
+# ── Step 6: Real-ESRGAN video upscaling (legacy/fallback) ────────────────────
 
 
 REALESRGAN_MODEL_PATH = os.path.join(MODEL_DIR, "RealESRGAN_x2plus.pth")
