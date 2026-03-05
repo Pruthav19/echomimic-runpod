@@ -3,7 +3,7 @@ name: Build and Push Docker Image Echomimic
 on:
   push:
     branches:
-      - master
+      - working-branch
 
 jobs:
   docker:
