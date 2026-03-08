@@ -8,7 +8,7 @@ import yaml
 import logging
 import glob
 
-from preprocess import preprocess_image, stabilize_background
+from preprocess import preprocess_image, prepare_background_reference, stabilize_background
 
 WORKSPACE = "/tmp/workspace"
 ECHOMIMIC_DIR = "/app/EchoMimic"
@@ -170,6 +170,7 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
 def handler(event):
     try:
         input_data = event.get("input", {})
+        background_lock = float(input_data.get("background_lock", 0.0))
         job_id = str(uuid.uuid4())[:8]
         job_dir = os.path.join(WORKSPACE, job_id)
         os.makedirs(job_dir, exist_ok=True)
@@ -180,9 +181,13 @@ def handler(event):
         # 1. Download Inputs
         raw_image_path  = os.path.join(job_dir, "avatar_raw.png")
         image_path      = os.path.join(job_dir, "avatar.png")
+        background_ref_path = os.path.join(job_dir, "avatar_bg_ref.png")
         audio_path      = os.path.join(job_dir, "audio.wav")
         download_file(input_data["avatar_image_url"], raw_image_path)
         download_file(input_data["audio_url"], audio_path)
+
+        if background_lock > 0.0:
+            prepare_background_reference(raw_image_path, background_ref_path)
 
         # 1b. Preprocess audio: resample to 16kHz mono + loudnorm
         #     This is the primary fix for lip-sync drift.
@@ -207,14 +212,14 @@ def handler(event):
         # 2b. Optional background stabilization for static-avatar use cases.
         #     Helps reduce drifting/changing backgrounds by blending non-face
         #     regions back toward the original reference image.
-        background_lock = float(input_data.get("background_lock", 0.0))
         if background_lock > 0.0:
             locked_path = os.path.join(job_dir, "output_bg_locked.mp4")
             final_video_path = stabilize_background(
                 final_video_path,
-                image_path,
+                background_ref_path,
                 locked_path,
                 lock_strength=background_lock,
+                fps_override=float(input_data.get("fps", 24)),
             )
 
         # 2c. Post-process: Real-ESRGAN 2× upscale (512→1024) + H.264 CRF 16

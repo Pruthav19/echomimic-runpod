@@ -237,6 +237,7 @@ def stabilize_background(
     reference_image_path: str,
     output_video_path: str,
     lock_strength: float = 0.85,
+    fps_override: float | None = None,
 ) -> str:
     """
     Reduces generative background drift by blending each output frame with the
@@ -264,7 +265,7 @@ def stabilize_background(
         return output_video_path
 
     cap = cv2.VideoCapture(input_video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 24
+    fps = float(fps_override) if fps_override else (cap.get(cv2.CAP_PROP_FPS) or 24)
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -299,7 +300,19 @@ def stabilize_background(
 
     blur_size = 41
     mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
-    background_mix = (1.0 - mask)[..., None] * lock_strength
+
+    # Stronger lock near frame edges helps suppress drifting/tinted studio
+    # backgrounds without freezing the central head-and-shoulders region.
+    yy, xx = np.mgrid[0:frame_h, 0:frame_w]
+    nx = ((xx / max(1, frame_w - 1)) - 0.5) * 2.0
+    ny = ((yy / max(1, frame_h - 1)) - 0.5) * 2.0
+    radial = np.clip(np.sqrt(nx * nx + ny * ny), 0.0, 1.0)
+    edge_boost = np.clip((radial - 0.35) / 0.65, 0.0, 1.0).astype(np.float32)
+
+    background_mix = np.maximum(
+        (1.0 - mask) * lock_strength,
+        edge_boost * min(1.0, lock_strength + 0.12) * 0.55,
+    )[..., None]
 
     tmp_video = output_video_path.replace(".mp4", "_noaudio.mp4")
     writer = cv2.VideoWriter(
@@ -452,4 +465,20 @@ def preprocess_image(input_path: str, output_path: str) -> str:
     logger.info(f"Preprocessed image: [{w0}×{h0}] → [{w1}×{h1}], saved to {output_path}")
 
     cv2.imwrite(output_path, img, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+    return output_path
+
+
+def prepare_background_reference(input_path: str, output_path: str) -> str:
+    """
+    Prepares a background reference aligned to the talking-head crop but without
+    GFPGAN or white-balance changes. This helps preserve the original background
+    color (e.g. clean white studio backdrops) for background stabilization.
+    """
+    img = cv2.imread(input_path)
+    if img is None:
+        raise RuntimeError(f"Cannot read image: {input_path}")
+
+    img = smart_portrait_crop(img)
+    cv2.imwrite(output_path, img, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+    logger.info(f"Background reference prepared → {output_path}")
     return output_path
