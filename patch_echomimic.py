@@ -13,9 +13,10 @@ with open(path) as f:
     src = f.read()
 
 old = "face_mask[rb - r_pad : re + r_pad, cb - c_pad : ce + c_pad] = 255"
-new = "face_mask[rb + int((re - rb) * 0.2) : re + r_pad, cb - c_pad : ce + c_pad] = 255"
-# 0.2 = mask starts 20% down from top of face bbox (just below eye line)
-# Gives more natural jaw/cheek expression vs 0.33 which was over-tight
+new = "face_mask[rb + int((re - rb) * 0.12) : re + r_pad, cb - c_pad : ce + c_pad] = 255"
+# 0.12 = mask starts 12% down from top of face bbox.
+# This allows a bit more upper-face / cheek motion than 0.20,
+# while still avoiding the original full-eye-line mask that caused wink artefacts.
 
 if old not in src:
     print(f"ERROR: patch target not found in {path}. Check EchoMimic version.", file=sys.stderr)

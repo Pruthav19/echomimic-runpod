@@ -8,7 +8,7 @@ import yaml
 import logging
 import glob
 
-from preprocess import preprocess_image
+from preprocess import preprocess_image, stabilize_background
 
 WORKSPACE = "/tmp/workspace"
 ECHOMIMIC_DIR = "/app/EchoMimic"
@@ -204,7 +204,20 @@ def handler(event):
         # 2. Run Generation
         final_video_path = run_echomimic(image_path, audio_path, job_dir, input_data)
 
-        # 2b. Post-process: Real-ESRGAN 2× upscale (512→1024) + H.264 CRF 16
+        # 2b. Optional background stabilization for static-avatar use cases.
+        #     Helps reduce drifting/changing backgrounds by blending non-face
+        #     regions back toward the original reference image.
+        background_lock = float(input_data.get("background_lock", 0.0))
+        if background_lock > 0.0:
+            locked_path = os.path.join(job_dir, "output_bg_locked.mp4")
+            final_video_path = stabilize_background(
+                final_video_path,
+                image_path,
+                locked_path,
+                lock_strength=background_lock,
+            )
+
+        # 2c. Post-process: Real-ESRGAN 2× upscale (512→1024) + H.264 CRF 16
         skip_enhance = input_data.get("skip_enhance", False)
         if not skip_enhance:
             from preprocess import enhance_video

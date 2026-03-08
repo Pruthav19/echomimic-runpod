@@ -231,6 +231,134 @@ def enhance_video(input_video_path: str, output_video_path: str) -> str:
         shutil.copy(input_video_path, output_video_path)
         return output_video_path
 
+
+def stabilize_background(
+    input_video_path: str,
+    reference_image_path: str,
+    output_video_path: str,
+    lock_strength: float = 0.85,
+) -> str:
+    """
+    Reduces generative background drift by blending each output frame with the
+    original reference image outside a soft head-and-shoulders mask.
+
+    `lock_strength` range:
+      0.0 = disabled
+      1.0 = background fully pulled back to the reference image
+
+    This improves stability for static portraits, while keeping the animated
+    face/head region from the generated video.
+    """
+    import shutil
+    import subprocess as sp
+
+    lock_strength = float(np.clip(lock_strength, 0.0, 1.0))
+    if lock_strength <= 0.0:
+        shutil.copy(input_video_path, output_video_path)
+        return output_video_path
+
+    reference = cv2.imread(reference_image_path)
+    if reference is None:
+        logger.warning("Background lock skipped: cannot read reference image.")
+        shutil.copy(input_video_path, output_video_path)
+        return output_video_path
+
+    cap = cv2.VideoCapture(input_video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if frame_w <= 0 or frame_h <= 0:
+        logger.warning("Background lock skipped: invalid video dimensions.")
+        cap.release()
+        shutil.copy(input_video_path, output_video_path)
+        return output_video_path
+
+    reference = cv2.resize(reference, (frame_w, frame_h), interpolation=cv2.INTER_CUBIC)
+    face = _detect_face_opencv(reference)
+    if face is None:
+        logger.warning("Background lock skipped: no face detected in reference image.")
+        cap.release()
+        shutil.copy(input_video_path, output_video_path)
+        return output_video_path
+
+    fx, fy, fw, fh = face
+    cx = int(fx + fw / 2)
+    cy = int(fy + fh * 1.0)
+
+    mask = np.zeros((frame_h, frame_w), dtype=np.float32)
+    ellipse_axes = (max(1, int(fw * 1.45)), max(1, int(fh * 1.95)))
+    cv2.ellipse(mask, (cx, cy), ellipse_axes, 0, 0, 360, 1.0, -1)
+
+    shoulder_left = max(0, int(cx - fw * 1.6))
+    shoulder_right = min(frame_w, int(cx + fw * 1.6))
+    shoulder_top = max(0, int(fy + fh * 0.9))
+    shoulder_bottom = min(frame_h, int(fy + fh * 3.0))
+    cv2.rectangle(mask, (shoulder_left, shoulder_top), (shoulder_right, shoulder_bottom), 1.0, -1)
+
+    blur_size = 41
+    mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
+    background_mix = (1.0 - mask)[..., None] * lock_strength
+
+    tmp_video = output_video_path.replace(".mp4", "_noaudio.mp4")
+    writer = cv2.VideoWriter(
+        tmp_video,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (frame_w, frame_h),
+    )
+
+    logger.info(
+        f"Applying background lock (strength={lock_strength:.2f}) to {total} frames..."
+    )
+
+    try:
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            blended = (
+                frame.astype(np.float32) * (1.0 - background_mix)
+                + reference.astype(np.float32) * background_mix
+            )
+            writer.write(np.clip(blended, 0, 255).astype(np.uint8))
+            idx += 1
+            if idx % 48 == 0:
+                logger.info(f"  {idx}/{total} frames background-locked")
+
+        cap.release()
+        writer.release()
+
+        sp.run(
+            [
+                "ffmpeg", "-y",
+                "-i", tmp_video,
+                "-i", input_video_path,
+                "-c:v", "libx264", "-crf", "16", "-preset", "fast",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-shortest",
+                output_video_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        os.remove(tmp_video)
+        logger.info(f"Background stabilized → {output_video_path}")
+        return output_video_path
+    except Exception as e:
+        logger.error(f"Background lock failed: {e} — using original video.")
+        cap.release()
+        writer.release()
+        if os.path.exists(tmp_video):
+            os.remove(tmp_video)
+        shutil.copy(input_video_path, output_video_path)
+        return output_video_path
+
     tmp_video = output_video_path.replace(".mp4", "_noaudio.mp4")
     try:
         upsampler = _get_upsampler()
