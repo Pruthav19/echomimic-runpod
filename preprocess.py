@@ -379,13 +379,13 @@ def stabilize_background(
     # This avoids blending the static reference face/body back on top of the
     # generated subject, which causes the grey/translucent shadow effect.
     reference_hsv = cv2.cvtColor(reference, cv2.COLOR_BGR2HSV)
-    bg_color_mask = (
+    reference_bg_mask = (
         (reference_hsv[:, :, 1] <= 28) &
         (reference_hsv[:, :, 2] >= 180)
     ).astype(np.float32)
-    bg_color_mask = cv2.GaussianBlur(bg_color_mask, (31, 31), 0)
+    reference_bg_mask = cv2.GaussianBlur(reference_bg_mask, (31, 31), 0)
 
-    background_mix = (background_mix * bg_color_mask)[..., None]
+    base_background_mix = background_mix * reference_bg_mask
 
     tmp_video = output_video_path.replace(".mp4", "_noaudio.mp4")
     writer = cv2.VideoWriter(
@@ -406,9 +406,21 @@ def stabilize_background(
             if not ret:
                 break
 
+            frame_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            frame_bg_mask = (
+                (frame_hsv[:, :, 1] <= 40) &
+                (frame_hsv[:, :, 2] >= 150)
+            ).astype(np.float32)
+            frame_bg_mask = cv2.GaussianBlur(frame_bg_mask, (21, 21), 0)
+
+            # Only replace areas that are background-like in BOTH the original
+            # reference and the generated frame. This prevents the reference
+            # portrait from bleeding over the animated face/body as a ghost.
+            frame_background_mix = (base_background_mix * frame_bg_mask)[..., None]
+
             blended = (
-                frame.astype(np.float32) * (1.0 - background_mix)
-                + reference.astype(np.float32) * background_mix
+                frame.astype(np.float32) * (1.0 - frame_background_mix)
+                + reference.astype(np.float32) * frame_background_mix
             )
             writer.write(np.clip(blended, 0, 255).astype(np.uint8))
             idx += 1
