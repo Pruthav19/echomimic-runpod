@@ -348,13 +348,15 @@ def stabilize_background(
     cy = int(fy + fh * 1.0)
 
     mask = np.zeros((frame_h, frame_w), dtype=np.float32)
-    ellipse_axes = (max(1, int(fw * 1.45)), max(1, int(fh * 1.95)))
+    # Protect more of the head / hair / shoulders so the reference image
+    # does not bleed through as a translucent "shadow" around the subject.
+    ellipse_axes = (max(1, int(fw * 1.75)), max(1, int(fh * 2.25)))
     cv2.ellipse(mask, (cx, cy), ellipse_axes, 0, 0, 360, 1.0, -1)
 
-    shoulder_left = max(0, int(cx - fw * 1.6))
-    shoulder_right = min(frame_w, int(cx + fw * 1.6))
-    shoulder_top = max(0, int(fy + fh * 0.9))
-    shoulder_bottom = min(frame_h, int(fy + fh * 3.0))
+    shoulder_left = max(0, int(cx - fw * 1.9))
+    shoulder_right = min(frame_w, int(cx + fw * 1.9))
+    shoulder_top = max(0, int(fy + fh * 0.75))
+    shoulder_bottom = min(frame_h, int(fy + fh * 3.2))
     cv2.rectangle(mask, (shoulder_left, shoulder_top), (shoulder_right, shoulder_bottom), 1.0, -1)
 
     blur_size = 41
@@ -371,7 +373,19 @@ def stabilize_background(
     background_mix = np.maximum(
         (1.0 - mask) * lock_strength,
         edge_boost * min(1.0, lock_strength + 0.12) * 0.55,
-    )[..., None]
+    )
+
+    # Only lock pixels that look like real background in the reference image.
+    # This avoids blending the static reference face/body back on top of the
+    # generated subject, which causes the grey/translucent shadow effect.
+    reference_hsv = cv2.cvtColor(reference, cv2.COLOR_BGR2HSV)
+    bg_color_mask = (
+        (reference_hsv[:, :, 1] <= 28) &
+        (reference_hsv[:, :, 2] >= 180)
+    ).astype(np.float32)
+    bg_color_mask = cv2.GaussianBlur(bg_color_mask, (31, 31), 0)
+
+    background_mix = (background_mix * bg_color_mask)[..., None]
 
     tmp_video = output_video_path.replace(".mp4", "_noaudio.mp4")
     writer = cv2.VideoWriter(
