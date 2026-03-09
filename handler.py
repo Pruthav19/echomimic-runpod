@@ -229,6 +229,9 @@ def handler(event):
             enhanced_path = os.path.join(job_dir, "output_enhanced.mp4")
             final_video_path = enhance_video(final_video_path, enhanced_path)
 
+        if not isinstance(final_video_path, (str, os.PathLike)):
+            raise RuntimeError(f"Invalid final video path returned: {final_video_path!r}")
+
         # 3. Upload to S3
         s3_key = f"echomimic_videos/{job_id}.mp4"
         video_url = upload_to_s3(final_video_path, s3_key)

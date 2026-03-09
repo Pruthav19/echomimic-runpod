@@ -231,6 +231,65 @@ def enhance_video(input_video_path: str, output_video_path: str) -> str:
         shutil.copy(input_video_path, output_video_path)
         return output_video_path
 
+    tmp_video = output_video_path.replace(".mp4", "_noaudio.mp4")
+    try:
+        upsampler = _get_upsampler()
+
+        cap = cv2.VideoCapture(input_video_path)
+        fps        = cap.get(cv2.CAP_PROP_FPS) or 24
+        orig_w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total      = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        out_w, out_h = orig_w * 2, orig_h * 2
+
+        writer = cv2.VideoWriter(
+            tmp_video,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (out_w, out_h),
+        )
+
+        logger.info(f"Upscaling {total} frames {orig_w}×{orig_h} → {out_w}×{out_h}…")
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            enhanced, _ = upsampler.enhance(frame, outscale=2)
+            writer.write(enhanced)
+            idx += 1
+            if idx % 48 == 0:
+                logger.info(f"  {idx}/{total} frames upscaled")
+
+        cap.release()
+        writer.release()
+
+        sp.run(
+            [
+                "ffmpeg", "-y",
+                "-i", tmp_video,
+                "-i", input_video_path,
+                "-c:v", "libx264", "-crf", "16", "-preset", "fast",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-shortest",
+                output_video_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        os.remove(tmp_video)
+        logger.info(f"Video enhanced → {output_video_path}")
+        return output_video_path
+
+    except Exception as e:
+        logger.error(f"Video enhancement failed: {e} — using original video.")
+        if os.path.exists(tmp_video):
+            os.remove(tmp_video)
+        shutil.copy(input_video_path, output_video_path)
+        return output_video_path
+
 
 def stabilize_background(
     input_video_path: str,
@@ -371,67 +430,6 @@ def stabilize_background(
             os.remove(tmp_video)
         shutil.copy(input_video_path, output_video_path)
         return output_video_path
-
-    tmp_video = output_video_path.replace(".mp4", "_noaudio.mp4")
-    try:
-        upsampler = _get_upsampler()
-
-        cap = cv2.VideoCapture(input_video_path)
-        fps        = cap.get(cv2.CAP_PROP_FPS) or 24
-        orig_w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        orig_h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total      = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        out_w, out_h = orig_w * 2, orig_h * 2
-
-        writer = cv2.VideoWriter(
-            tmp_video,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (out_w, out_h),
-        )
-
-        logger.info(f"Upscaling {total} frames {orig_w}×{orig_h} → {out_w}×{out_h}…")
-        idx = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            enhanced, _ = upsampler.enhance(frame, outscale=2)
-            writer.write(enhanced)
-            idx += 1
-            if idx % 48 == 0:
-                logger.info(f"  {idx}/{total} frames upscaled")
-
-        cap.release()
-        writer.release()
-
-        # Re-encode with libx264 CRF 16 and mux original audio
-        sp.run(
-            [
-                "ffmpeg", "-y",
-                "-i", tmp_video,
-                "-i", input_video_path,
-                "-c:v", "libx264", "-crf", "16", "-preset", "fast",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k",
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-shortest",
-                output_video_path,
-            ],
-            check=True,
-            capture_output=True,
-        )
-        os.remove(tmp_video)
-        logger.info(f"Video enhanced → {output_video_path}")
-        return output_video_path
-
-    except Exception as e:
-        logger.error(f"Video enhancement failed: {e} — using original video.")
-        if os.path.exists(tmp_video):
-            os.remove(tmp_video)
-        shutil.copy(input_video_path, output_video_path)
-        return output_video_path
-
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
