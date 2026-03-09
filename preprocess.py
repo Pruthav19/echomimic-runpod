@@ -13,6 +13,7 @@ model-load cost on every request inside the same serverless worker process.
 """
 
 import os
+import sys
 import logging
 
 import cv2
@@ -27,9 +28,28 @@ GFPGAN_MODEL_PATH = os.path.join(MODEL_DIR, "GFPGANv1.4.pth")
 _gfpgan_restorer = None
 
 
+def _ensure_torchvision_compat():
+    """
+    GFPGAN / facexlib / Real-ESRGAN may import the old
+    `torchvision.transforms.functional_tensor` module path, which was moved in
+    newer torchvision releases. Register a compatibility alias when possible.
+    """
+    legacy_name = "torchvision.transforms.functional_tensor"
+    if legacy_name in sys.modules:
+        return
+
+    try:
+        from torchvision.transforms import _functional_tensor as functional_tensor
+        sys.modules[legacy_name] = functional_tensor
+        logger.info("Registered torchvision functional_tensor compatibility shim.")
+    except Exception as e:
+        logger.warning(f"Torchvision compatibility shim unavailable: {e}")
+
+
 def _get_restorer():
     global _gfpgan_restorer
     if _gfpgan_restorer is None:
+        _ensure_torchvision_compat()
         from gfpgan import GFPGANer
         logger.info("Loading GFPGAN v1.4 model (one-time cost)…")
         _gfpgan_restorer = GFPGANer(
@@ -194,6 +214,7 @@ _realesrgan_upsampler = None
 def _get_upsampler():
     global _realesrgan_upsampler
     if _realesrgan_upsampler is None:
+        _ensure_torchvision_compat()
         from basicsr.archs.rrdbnet_arch import RRDBNet
         from realesrgan import RealESRGANer
         logger.info("Loading Real-ESRGAN x2 model (one-time cost)…")
