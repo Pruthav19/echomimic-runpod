@@ -320,15 +320,15 @@ def stabilize_background(
     fps_override: float | None = None,
 ) -> str:
     """
-    Reduces generative background drift by blending each output frame with the
-    original reference image outside a soft head-and-shoulders mask.
+    Reduces generative background drift by repainting background-like regions
+    toward the original background color outside a soft head-and-shoulders mask.
 
     `lock_strength` range:
       0.0 = disabled
-      1.0 = background fully pulled back to the reference image
+            1.0 = background fully pulled back to the reference background color
 
-    This improves stability for static portraits, while keeping the animated
-    face/head region from the generated video.
+        This improves stability for static portraits while avoiding the ghosting
+        that happens when the full reference portrait is blended back in.
     """
     import shutil
     import subprocess as sp
@@ -397,8 +397,6 @@ def stabilize_background(
     )
 
     # Only lock pixels that look like real background in the reference image.
-    # This avoids blending the static reference face/body back on top of the
-    # generated subject, which causes the grey/translucent shadow effect.
     reference_hsv = cv2.cvtColor(reference, cv2.COLOR_BGR2HSV)
     reference_bg_mask = (
         (reference_hsv[:, :, 1] <= 28) &
@@ -407,6 +405,20 @@ def stabilize_background(
     reference_bg_mask = cv2.GaussianBlur(reference_bg_mask, (31, 31), 0)
 
     base_background_mix = background_mix * reference_bg_mask
+
+    bg_pixels = reference[reference_bg_mask > 0.65]
+    if bg_pixels.size == 0:
+        corner_size = max(8, min(frame_w, frame_h) // 12)
+        corner_samples = [
+            reference[:corner_size, :corner_size],
+            reference[:corner_size, frame_w - corner_size:],
+            reference[frame_h - corner_size:, :corner_size],
+            reference[frame_h - corner_size:, frame_w - corner_size:],
+        ]
+        bg_pixels = np.concatenate([sample.reshape(-1, 3) for sample in corner_samples], axis=0)
+
+    bg_color = np.mean(bg_pixels, axis=0).astype(np.float32)
+    background_canvas = np.broadcast_to(bg_color, (frame_h, frame_w, 3)).astype(np.float32)
 
     tmp_video = output_video_path.replace(".mp4", "_noaudio.mp4")
     writer = cv2.VideoWriter(
@@ -435,13 +447,13 @@ def stabilize_background(
             frame_bg_mask = cv2.GaussianBlur(frame_bg_mask, (21, 21), 0)
 
             # Only replace areas that are background-like in BOTH the original
-            # reference and the generated frame. This prevents the reference
-            # portrait from bleeding over the animated face/body as a ghost.
+            # reference and the generated frame. This keeps the animated
+            # subject intact and only repaints likely background pixels.
             frame_background_mix = (base_background_mix * frame_bg_mask)[..., None]
 
             blended = (
                 frame.astype(np.float32) * (1.0 - frame_background_mix)
-                + reference.astype(np.float32) * frame_background_mix
+                + background_canvas * frame_background_mix
             )
             writer.write(np.clip(blended, 0, 255).astype(np.uint8))
             idx += 1
