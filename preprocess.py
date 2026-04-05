@@ -21,7 +21,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-MODEL_DIR = os.environ.get("MODEL_DIR", "/runpod-volume/echomimic_models")
+MODEL_DIR = os.environ.get("MODEL_DIR", "/app/models")
 GFPGAN_MODEL_PATH = os.path.join(MODEL_DIR, "GFPGANv1.4.pth")
 
 # ── Lazy singleton ────────────────────────────────────────────────────────────
@@ -235,79 +235,120 @@ def _get_upsampler():
     return _realesrgan_upsampler
 
 
+# Real-ESRGAN is high quality but expensive: ~1s/frame on an A100.
+# For videos longer than this many frames we use fast ffmpeg lanczos upscale instead,
+# which is visually close and costs ~5% of the GPU time.
+_MAX_REALESRGAN_FRAMES = 360   # ~15 s at 24 fps
+
+
+def _ffmpeg_upscale(input_video_path: str, output_video_path: str) -> str:
+    """Fast 2× upscale via ffmpeg lanczos + mild unsharp. CPU-only, no GPU cost."""
+    import subprocess as sp
+
+    sp.run(
+        [
+            "ffmpeg", "-y",
+            "-i", input_video_path,
+            "-vf", "scale=iw*2:ih*2:flags=lanczos,unsharp=5:5:0.8:3:3:0.0",
+            "-c:v", "libx264", "-crf", "16", "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            output_video_path,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    logger.info(f"Video upscaled (ffmpeg lanczos) → {output_video_path}")
+    return output_video_path
+
+
+def _realesrgan_upscale(input_video_path: str, output_video_path: str) -> str:
+    """Full Real-ESRGAN 2× upscale. Best quality, use only for short clips."""
+    import subprocess as sp
+
+    upsampler = _get_upsampler()
+    tmp_video = output_video_path.replace(".mp4", "_noaudio.mp4")
+
+    cap = cv2.VideoCapture(input_video_path)
+    fps      = cap.get(cv2.CAP_PROP_FPS) or 24
+    orig_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total    = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    out_w, out_h = orig_w * 2, orig_h * 2
+
+    writer = cv2.VideoWriter(
+        tmp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h)
+    )
+    logger.info(f"RealESRGAN: upscaling {total} frames {orig_w}×{orig_h} → {out_w}×{out_h}…")
+    idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        enhanced, _ = upsampler.enhance(frame, outscale=2)
+        writer.write(enhanced)
+        idx += 1
+        if idx % 48 == 0:
+            logger.info(f"  {idx}/{total} frames upscaled")
+    cap.release()
+    writer.release()
+
+    sp.run(
+        [
+            "ffmpeg", "-y",
+            "-i", tmp_video,
+            "-i", input_video_path,
+            "-c:v", "libx264", "-crf", "16", "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-shortest",
+            output_video_path,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    os.remove(tmp_video)
+    logger.info(f"Video enhanced (RealESRGAN) → {output_video_path}")
+    return output_video_path
+
+
 def enhance_video(input_video_path: str, output_video_path: str) -> str:
     """
-    Upscales every frame of *input_video_path* 2× using Real-ESRGAN
-    (512×512 → 1024×1024), then muxes the original audio back via ffmpeg
-    and re-encodes with high-quality H.264 (CRF 16).
+    2× upscale the output video (512×512 → 1024×1024).
 
-    Falls back to copying the original video if the model is missing or
-    any step fails, so inference output is never lost.
+    Strategy:
+    - Short clips (≤ _MAX_REALESRGAN_FRAMES): Real-ESRGAN for maximum quality.
+    - Long clips (> _MAX_REALESRGAN_FRAMES): ffmpeg lanczos + unsharp — visually
+      close to ESRGAN but uses CPU only and runs ~20× faster, keeping cost in budget.
+    - Falls back to the original video if anything fails.
     """
-    import subprocess as sp
     import shutil
 
-    if not os.path.isfile(REALESRGAN_MODEL_PATH):
-        logger.warning("RealESRGAN model not found — skipping video enhancement.")
-        shutil.copy(input_video_path, output_video_path)
-        return output_video_path
+    # Probe frame count without decoding
+    cap = cv2.VideoCapture(input_video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
 
-    tmp_video = output_video_path.replace(".mp4", "_noaudio.mp4")
+    use_realesrgan = (
+        os.path.isfile(REALESRGAN_MODEL_PATH)
+        and total_frames <= _MAX_REALESRGAN_FRAMES
+    )
+
     try:
-        upsampler = _get_upsampler()
-
-        cap = cv2.VideoCapture(input_video_path)
-        fps        = cap.get(cv2.CAP_PROP_FPS) or 24
-        orig_w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        orig_h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total      = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        out_w, out_h = orig_w * 2, orig_h * 2
-
-        writer = cv2.VideoWriter(
-            tmp_video,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (out_w, out_h),
-        )
-
-        logger.info(f"Upscaling {total} frames {orig_w}×{orig_h} → {out_w}×{out_h}…")
-        idx = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            enhanced, _ = upsampler.enhance(frame, outscale=2)
-            writer.write(enhanced)
-            idx += 1
-            if idx % 48 == 0:
-                logger.info(f"  {idx}/{total} frames upscaled")
-
-        cap.release()
-        writer.release()
-
-        sp.run(
-            [
-                "ffmpeg", "-y",
-                "-i", tmp_video,
-                "-i", input_video_path,
-                "-c:v", "libx264", "-crf", "16", "-preset", "fast",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k",
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-shortest",
-                output_video_path,
-            ],
-            check=True,
-            capture_output=True,
-        )
-        os.remove(tmp_video)
-        logger.info(f"Video enhanced → {output_video_path}")
-        return output_video_path
-
+        if use_realesrgan:
+            return _realesrgan_upscale(input_video_path, output_video_path)
+        else:
+            if not os.path.isfile(REALESRGAN_MODEL_PATH):
+                logger.info("RealESRGAN weights absent — using ffmpeg upscale.")
+            else:
+                logger.info(
+                    f"Video has {total_frames} frames (>{_MAX_REALESRGAN_FRAMES} limit) "
+                    "— using fast ffmpeg upscale to stay in budget."
+                )
+            return _ffmpeg_upscale(input_video_path, output_video_path)
     except Exception as e:
-        logger.error(f"Video enhancement failed: {e} — using original video.")
-        if os.path.exists(tmp_video):
-            os.remove(tmp_video)
+        logger.error(f"Video enhancement failed: {e} — keeping original video.")
         shutil.copy(input_video_path, output_video_path)
         return output_video_path
 

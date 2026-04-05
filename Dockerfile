@@ -1,5 +1,6 @@
 # ══════════════════════════════════════════════════════════════════
 # EchoMimic Serverless Image for RunPod
+# Models are baked in at build time — no network volume required.
 # ══════════════════════════════════════════════════════════════════
 FROM runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04
 
@@ -8,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=0
 
 RUN pip install --upgrade pip
 
-# ── 1. System Dependencies (Crucial for OpenCV & MediaPipe) ──────
+# ── 1. System Dependencies ──────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg libgl1-mesa-glx libglib2.0-0 git wget curl pkg-config \
     libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
@@ -17,41 +18,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# ── 2. Clone EchoMimic ───────────────────────────────────────────
+# ── 2. Clone EchoMimic ──────────────────────────────────────────
 RUN git clone https://github.com/BadToBest/EchoMimic.git /app/EchoMimic
 
-# ── 2b. Patch: shift face mask to start from nose level ──────────
-# The default mask starts at the top of the MTCNN bbox (eye level), causing
-# a one-eye-winking artefact. We shift it to start 33% down (nose bridge)
-# so only the mouth/chin region is animated.
+# ── 2b. Patch: shift face mask to nose level ────────────────────
 COPY patch_echomimic.py /app/patch_echomimic.py
 RUN python3 /app/patch_echomimic.py
 
-# ── 3. Install EchoMimic Dependencies ────────────────────────────
+# ── 3. Install EchoMimic Dependencies ───────────────────────────
 WORKDIR /app/EchoMimic
 RUN pip install -r requirements.txt
-
-# 🚨 THE MAGIC FIXES: Downgrade protobuf and force correct mediapipe
 RUN pip install "protobuf<4"
 RUN pip uninstall -y mediapipe && pip install mediapipe==0.10.15
-RUN pip install onnxruntime-gpu "numpy<2.0" "opencv-python<4.10.0" "opencv-contrib-python<4.10.0" "opencv-python-headless<4.10.0"
+RUN pip install onnxruntime-gpu "numpy<2.0" \
+    "opencv-python<4.10.0" \
+    "opencv-contrib-python<4.10.0" \
+    "opencv-python-headless<4.10.0"
 
 # ── 4. Install Serverless Handler Dependencies ───────────────────
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
-# Install gfpgan with --no-deps so pip NEVER touches torch/torchvision.
-# Then manually add only gfpgan's non-torch runtime deps.
 RUN pip install gfpgan --no-deps
 RUN pip install basicsr facexlib realesrgan
 RUN pip install -r requirements.txt
 
-# ── 5. Lock HuggingFace stack + NumPy + Torch ────────────────────────────
-# huggingface_hub==0.21.3: has both cached_download and is_offline_mode.
-# transformers<4.40: compatible with hf_hub 0.21.x and torch 2.2.0.
-# numpy<2.0: basicsr/realesrgan pull in numpy 2.x which breaks torch here.
-# accelerate: prevents low_cpu_mem_usage fallback / slower model loads.
-# torch/torchvision are reinstalled with correct CUDA 12.1 wheels to fix
-# overwrites caused by basicsr/facexlib/realesrgan missing --no-deps.
+# ── 5. Lock HuggingFace + NumPy + Torch ─────────────────────────
+# Must happen before model download so the correct hf_hub version is used.
 RUN pip install --force-reinstall \
     "huggingface_hub==0.21.3" \
     "transformers>=4.35.0,<4.40.0" \
@@ -61,16 +53,19 @@ RUN pip install --force-reinstall \
     "torchvision==0.17.0" \
     --extra-index-url https://download.pytorch.org/whl/cu121
 
-# ── 6. Copy Scripts ──────────────────────────────────────────────
+# ── 6. Copy Application Scripts ──────────────────────────────────
 COPY download_models.py /app/download_models.py
-COPY handler.py /app/handler.py
-COPY preprocess.py /app/preprocess.py
-COPY patch_echomimic.py /app/patch_echomimic.py
-COPY start.sh /app/start.sh
+COPY handler.py         /app/handler.py
+COPY preprocess.py      /app/preprocess.py
+COPY start.sh           /app/start.sh
 RUN chmod +x /app/start.sh
 
-# ── Environment Variables ────────────────────────────────────────
+# ── 7. Bake All Models Into The Image ───────────────────────────
+# Downloaded once at build time → instant cold starts, no volume needed.
+ENV MODEL_DIR="/app/models"
+RUN python /app/download_models.py
+
+# ── Environment ──────────────────────────────────────────────────
 ENV PYTHONPATH="/app/EchoMimic"
-ENV MODEL_DIR="/runpod-volume/echomimic_models"
 
 CMD ["/app/start.sh"]

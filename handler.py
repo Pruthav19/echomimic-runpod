@@ -20,6 +20,10 @@ S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+MAX_CONTEXT_FRAMES = 32
+DEFAULT_CONTEXT_FRAMES = 24   # 16 was too short; 24 gives smoother lip motion across windows
+DEFAULT_CONTEXT_OVERLAP = 8   # proportional increase to reduce inter-window seam artifacts
+
 def get_s3_client():
     return boto3.client(
         "s3",
@@ -41,6 +45,39 @@ def upload_to_s3(local_path, s3_key):
     s3.upload_file(local_path, S3_BUCKET, s3_key, ExtraArgs={"ContentType": "video/mp4"})
     url = s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": s3_key}, ExpiresIn=3600)
     return url
+
+
+def _resolve_temporal_window(user_params):
+    requested_frames = int(user_params.get("context_frames", DEFAULT_CONTEXT_FRAMES))
+    requested_overlap = int(user_params.get("context_overlap", DEFAULT_CONTEXT_OVERLAP))
+
+    if requested_frames < 1:
+        logger.warning("context_frames=%s is invalid; using default %s.", requested_frames, DEFAULT_CONTEXT_FRAMES)
+        requested_frames = DEFAULT_CONTEXT_FRAMES
+
+    if requested_frames > MAX_CONTEXT_FRAMES:
+        logger.warning(
+            "context_frames=%s exceeds EchoMimic's supported maximum of %s; clamping.",
+            requested_frames,
+            MAX_CONTEXT_FRAMES,
+        )
+        requested_frames = MAX_CONTEXT_FRAMES
+
+    max_overlap = max(0, requested_frames - 1)
+    if requested_overlap < 0:
+        logger.warning("context_overlap=%s is invalid; using default %s.", requested_overlap, DEFAULT_CONTEXT_OVERLAP)
+        requested_overlap = DEFAULT_CONTEXT_OVERLAP
+
+    if requested_overlap > max_overlap:
+        logger.warning(
+            "context_overlap=%s is too large for context_frames=%s; clamping to %s.",
+            requested_overlap,
+            requested_frames,
+            max_overlap,
+        )
+        requested_overlap = max_overlap
+
+    return requested_frames, requested_overlap
 
 def preprocess_audio(input_path: str, output_path: str) -> str:
     """
@@ -121,20 +158,18 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
     cfg  = float(user_params.get("cfg_scale",        2.5))  # 2.5 keeps expressions natural; 3.0+ causes stiffness
     fps  = int(user_params.get("fps",                24))
     seed = int(user_params.get("seed",               42))
-    # context_frames=16 + context_overlap=6: larger window + more overlap
-    # dramatically reduces motion seams and improves expression continuity
-    ctx_frames  = int(user_params.get("context_frames",   16))
-    ctx_overlap = int(user_params.get("context_overlap",   6))
+    # EchoMimic's temporal positional encoding supports up to 32 frames.
+    # Larger values crash inside the motion module regardless of available VRAM.
+    ctx_frames, ctx_overlap = _resolve_temporal_window(user_params)
 
     # facecrop_dilation_ratio: how much padding around the face box for the reference crop
     #   0.5 = default (tight); 1.2 = generous shoulder/hair room
     facecrop_dilation = float(user_params.get("face_expand_ratio",    0.5))
 
     # facemusk_dilation_ratio: padding around the face bbox for the animated mask.
-    #   The EchoMimic source is already patched to start the mask from nose level,
-    #   so 0.0 here means zero extra padding beyond that lower-face region.
-    #   Increase slightly (e.g. 0.05) only if mouth corners feel clipped.
-    facemask_dilation = float(user_params.get("face_mask_dilation",   0.0))
+    #   0.05 adds slight extra coverage so mouth corners aren't clipped at the mask edge.
+    #   Increase to 0.1 if corners still clip; lower to 0.0 if mask bleeds into chin/neck.
+    facemask_dilation = float(user_params.get("face_mask_dilation",   0.05))
 
     cmd = [
         "python", "-u", "infer_audio2vid.py",

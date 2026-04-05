@@ -3,7 +3,7 @@ import sys
 import urllib.request
 from huggingface_hub import snapshot_download
 
-MODEL_DIR = os.environ.get("MODEL_DIR", "/runpod-volume/echomimic_models")
+MODEL_DIR = os.environ.get("MODEL_DIR", "/app/models")
 
 
 def _has_vae_weights(vae_dir):
@@ -21,8 +21,6 @@ def download_models():
     # 1. Main EchoMimic weights — MUST land directly in MODEL_DIR (not a subdir).
     #    start.sh symlinks MODEL_DIR → /app/EchoMimic/pretrained_weights, so
     #    files here map to ./pretrained_weights/<file> as the yaml config expects.
-    #    This repo includes: denoising_unet.pth, reference_unet.pth,
-    #    face_locator.pth, motion_module.pth, audio_processor/whisper_tiny.pt
     snapshot_download(repo_id="BadToBest/EchoMimic", local_dir=MODEL_DIR)
 
     # 2. SD Image Variations — backbone for the reference UNet
