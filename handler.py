@@ -21,8 +21,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MAX_CONTEXT_FRAMES = 32
-DEFAULT_CONTEXT_FRAMES = 24   # 16 was too short; 24 gives smoother lip motion across windows
-DEFAULT_CONTEXT_OVERLAP = 8   # proportional increase to reduce inter-window seam artifacts
+DEFAULT_CONTEXT_FRAMES = 16   # EchoMimic temporal attention is trained on 12-16; larger causes jitter
+DEFAULT_CONTEXT_OVERLAP = 8   # 50% of context_frames — critical for smooth seams between windows
 
 def get_s3_client():
     return boto3.client(
@@ -155,7 +155,7 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
     w    = int(user_params.get("target_size",       512))
     h    = int(user_params.get("target_size",       512))
     steps = int(user_params.get("inference_steps",   40))
-    cfg  = float(user_params.get("cfg_scale",        2.5))  # 2.5 keeps expressions natural; 3.0+ causes stiffness
+    cfg  = float(user_params.get("cfg_scale",        3.0))  # 2.5=too mushy/no motion; 3.5=stiff; 3.0 is the sweet spot
     fps  = int(user_params.get("fps",                24))
     seed = int(user_params.get("seed",               42))
     # EchoMimic's temporal positional encoding supports up to 32 frames.
@@ -169,7 +169,7 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
     # facemusk_dilation_ratio: padding around the face bbox for the animated mask.
     #   0.05 adds slight extra coverage so mouth corners aren't clipped at the mask edge.
     #   Increase to 0.1 if corners still clip; lower to 0.0 if mask bleeds into chin/neck.
-    facemask_dilation = float(user_params.get("face_mask_dilation",   0.05))
+    facemask_dilation = float(user_params.get("face_mask_dilation",   0.1))
 
     cmd = [
         "python", "-u", "infer_audio2vid.py",

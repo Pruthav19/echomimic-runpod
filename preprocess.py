@@ -235,10 +235,9 @@ def _get_upsampler():
     return _realesrgan_upsampler
 
 
-# Real-ESRGAN is high quality but expensive: ~1s/frame on an A100.
-# For videos longer than this many frames we use fast ffmpeg lanczos upscale instead,
-# which is visually close and costs ~5% of the GPU time.
-_MAX_REALESRGAN_FRAMES = 360   # ~15 s at 24 fps
+# Real-ESRGAN on an H100 runs ~0.15s/frame — 60s of video costs ~216s of GPU time,
+# well within budget. Fallback to ffmpeg only for very long videos (>60s).
+_MAX_REALESRGAN_FRAMES = 1440   # 60 s at 24 fps
 
 
 def _ffmpeg_upscale(input_video_path: str, output_video_path: str) -> str:
@@ -262,8 +261,38 @@ def _ffmpeg_upscale(input_video_path: str, output_video_path: str) -> str:
     return output_video_path
 
 
+_SHARPEN_KERNEL = np.array([
+    [ 0, -1,  0],
+    [-1,  5, -1],
+    [ 0, -1,  0],
+], dtype=np.float32)
+
+
+def _sharpen_mouth_region(frame: np.ndarray, face: tuple) -> np.ndarray:
+    """
+    Apply targeted unsharp sharpening to the mouth area of an upscaled frame.
+    `face` is (x, y, w, h) in the upscaled frame's coordinate space.
+    Uses a soft elliptical blend mask so there's no hard edge.
+    """
+    fx, fy, fw, fh = face
+    # Mouth region: centre-bottom 40% of the face bbox
+    mx = fx + fw // 2
+    my = fy + int(fh * 0.65)          # vertical centre of mouth zone
+    mw = int(fw * 0.65)               # half-width of sharpening ellipse
+    mh = int(fh * 0.22)               # half-height
+
+    h, w = frame.shape[:2]
+    mask = np.zeros((h, w), dtype=np.float32)
+    cv2.ellipse(mask, (mx, my), (max(1, mw), max(1, mh)), 0, 0, 360, 1.0, -1)
+    mask = cv2.GaussianBlur(mask, (31, 31), 0)[..., None]
+
+    sharpened = cv2.filter2D(frame, -1, _SHARPEN_KERNEL)
+    result = frame.astype(np.float32) * (1.0 - mask) + sharpened.astype(np.float32) * mask
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 def _realesrgan_upscale(input_video_path: str, output_video_path: str) -> str:
-    """Full Real-ESRGAN 2× upscale. Best quality, use only for short clips."""
+    """Full Real-ESRGAN 2× upscale with targeted mouth sharpening."""
     import subprocess as sp
 
     upsampler = _get_upsampler()
@@ -280,16 +309,28 @@ def _realesrgan_upscale(input_video_path: str, output_video_path: str) -> str:
         tmp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h)
     )
     logger.info(f"RealESRGAN: upscaling {total} frames {orig_w}×{orig_h} → {out_w}×{out_h}…")
+
+    # Detect face once from first frame to get stable sharpening coords.
+    # Re-detect every 48 frames to handle any drift.
+    cached_face = None
     idx = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         enhanced, _ = upsampler.enhance(frame, outscale=2)
+
+        if idx % 48 == 0:
+            cached_face = _detect_face_opencv(enhanced)
+            if idx > 0:
+                logger.info(f"  {idx}/{total} frames upscaled")
+
+        if cached_face is not None:
+            enhanced = _sharpen_mouth_region(enhanced, cached_face)
+
         writer.write(enhanced)
         idx += 1
-        if idx % 48 == 0:
-            logger.info(f"  {idx}/{total} frames upscaled")
+
     cap.release()
     writer.release()
 
@@ -309,7 +350,7 @@ def _realesrgan_upscale(input_video_path: str, output_video_path: str) -> str:
         capture_output=True,
     )
     os.remove(tmp_video)
-    logger.info(f"Video enhanced (RealESRGAN) → {output_video_path}")
+    logger.info(f"Video enhanced (RealESRGAN + mouth sharpen) → {output_video_path}")
     return output_video_path
 
 
