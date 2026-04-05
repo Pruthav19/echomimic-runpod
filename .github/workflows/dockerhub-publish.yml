@@ -12,6 +12,20 @@ jobs:
       contents: read
 
     steps:
+      # Free ~25 GB on the runner before the build.
+      # ubuntu-latest has ~14 GB free; our image is ~18 GB.
+      # This removes Android SDK (~8 GB), .NET (~2 GB), Haskell (~5 GB), etc.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -66,9 +80,10 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          provenance: false
           tags: |
             ${{ steps.meta.outputs.tags }}
             ${{ secrets.DOCKERHUB_USERNAME }}/echomimic-runpod:${{ steps.version.outputs.next_tag }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
