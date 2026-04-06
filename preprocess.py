@@ -478,17 +478,19 @@ def composite_face_video(
     dest_h = rd_y2 - rd_y1
 
     # --- Build the blend mask in destination patch space ---
-    # Ellipse centred on the lower half of the face (mouth/chin area gets full weight).
+    # Ellipse centred on the face, stopping well above the collar.
+    # fh * 0.55 vertical radius means the mask reaches ~chin bottom at most —
+    # it does NOT extend into the shirt/collar, preventing the halo artifact.
     mask_patch = np.zeros((dest_h, dest_w), dtype=np.float32)
     mc_x = dest_w // 2
-    mc_y = int(dest_h * 0.45)
+    mc_y = int(dest_h * 0.38)   # slightly above centre → keeps bottom above collar
     cv2.ellipse(
         mask_patch,
         (mc_x, mc_y),
-        (max(1, int(dest_w * 0.42)), max(1, int(dest_h * 0.46))),
+        (max(1, int(dest_w * 0.40)), max(1, int(dest_h * 0.38))),
         0, 0, 360, 1.0, -1,
     )
-    feather = max(21, int(dest_w * 0.22) | 1)   # must be odd
+    feather = max(21, int(dest_w * 0.28) | 1)   # heavy feather = invisible seam
     mask_patch = cv2.GaussianBlur(mask_patch, (feather, feather), 0)[..., None]
 
     # --- Output is at the reference image's native resolution ---
@@ -521,11 +523,28 @@ def composite_face_video(
         src_patch = frame[gs_y1:gs_y2, gs_x1:gs_x2]
         src_resized = cv2.resize(src_patch, (dest_w, dest_h), interpolation=cv2.INTER_LANCZOS4)
 
-        # 3. Blend into the reference at the correct location
-        dest_region = canvas[rd_y1:rd_y2, rd_x1:rd_x2]
+        # 3. Color-match the generated patch to the reference skin tone.
+        #    Reinhard color transfer (per-channel mean+std shift in Lab space)
+        #    removes any diffusion-model color cast before blending.
+        dest_region = canvas[rd_y1:rd_y2, rd_x1:rd_x2].astype(np.uint8)
+        src_lab = cv2.cvtColor(src_resized, cv2.COLOR_BGR2Lab).astype(np.float32)
+        ref_lab = cv2.cvtColor(dest_region, cv2.COLOR_BGR2Lab).astype(np.float32)
+        for ch in range(3):
+            src_std = src_lab[:, :, ch].std() + 1e-6
+            ref_std = ref_lab[:, :, ch].std() + 1e-6
+            src_lab[:, :, ch] = (
+                (src_lab[:, :, ch] - src_lab[:, :, ch].mean())
+                * (ref_std / src_std)
+                + ref_lab[:, :, ch].mean()
+            )
+        src_matched = cv2.cvtColor(
+            np.clip(src_lab, 0, 255).astype(np.uint8), cv2.COLOR_Lab2BGR
+        )
+
+        # 4. Blend color-matched patch into the reference
         blended_region = (
-            dest_region * (1.0 - mask_patch)
-            + src_resized.astype(np.float32) * mask_patch
+            dest_region.astype(np.float32) * (1.0 - mask_patch)
+            + src_matched.astype(np.float32) * mask_patch
         )
         canvas[rd_y1:rd_y2, rd_x1:rd_x2] = blended_region
 
@@ -758,15 +777,13 @@ def preprocess_image(input_path: str, output_path: str) -> str:
 
     Steps:
       1. Centre-square crop  – preserves original framing (no face zoom)
-      2. GFPGAN face restoration (upscales 2×, sharpens face details)
-      3. White balance correction
-      4. Resize to 512×512  – EchoMimic's required input resolution
+      2. Resize to 512×512  – EchoMimic's required input resolution
 
-    NOTE: smart_portrait_crop was removed. It cropped tight to the face
-    before EchoMimic, so the model generated a face-zoomed output and the
-    final video looked like a giant close-up. EchoMimic's internal MTCNN
-    handles face detection — our job is just to give it a clean square image
-    at the right resolution with the original framing intact.
+    GFPGAN and white_balance are intentionally skipped:
+    - GFPGAN upscale=2 causes colour shifts and plastic-looking skin.
+    - Gray-world white balance makes warm skin tones orange.
+    - Both hurt composite quality since the generated face won't match
+      the original skin tone of the reference image used for compositing.
     """
     img = cv2.imread(input_path)
     if img is None:
@@ -775,16 +792,10 @@ def preprocess_image(input_path: str, output_path: str) -> str:
     h0, w0 = img.shape[:2]
     logger.info(f"Preprocessing image {input_path} [{w0}×{h0}]")
 
-    # 1. Centre-square crop (no face zoom)
+    # 1. Centre-square crop (preserves original framing)
     img = _center_square_crop(img)
 
-    # 2. GFPGAN restoration (upscales 2×)
-    img = restore_face(img)
-
-    # 3. White balance
-    img = white_balance(img)
-
-    # 4. Resize to 512×512 for EchoMimic
+    # 2. Resize to 512×512 for EchoMimic
     img = cv2.resize(img, (512, 512), interpolation=cv2.INTER_LANCZOS4)
 
     h1, w1 = img.shape[:2]
