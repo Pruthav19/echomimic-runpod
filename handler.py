@@ -248,13 +248,15 @@ def handler(event):
         #     reference image per frame.  This is the key HeyGen-style step —
         #     the diffusion model never touches the background, so there is zero
         #     drift and the original image quality is preserved everywhere except
-        #     the mouth/face region.  background_lock is no longer needed.
+        #     the mouth/face region.
+        #     We use raw_image_path (original download) as the background so the
+        #     composite has full-resolution, unprocessed background quality.
         skip_composite = input_data.get("skip_composite", False)
         if not skip_composite:
             composite_path = os.path.join(job_dir, "output_composite.mp4")
             final_video_path = composite_face_video(
                 final_video_path,
-                image_path,
+                raw_image_path,
                 composite_path,
                 fps_override=float(input_data.get("fps", 24)),
             )

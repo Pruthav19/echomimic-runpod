@@ -403,75 +403,133 @@ def composite_face_video(
     """
     HeyGen-style face composite.
 
-    For every frame of the generated video:
-      1. Keep the original reference image as the background (zero drift).
-      2. Blend ONLY the animated face region from the generated frame back in,
-         using a soft elliptical mask so there is no hard seam.
+    The generated video (512×512, from EchoMimic) is always face-zoomed.
+    The reference image is the original photo at its native resolution.
 
-    This is the single biggest quality gap vs HeyGen: they never let the
-    diffusion model touch the background.  The result is a perfectly clean
-    background with a naturally animated lower face.
+    Strategy:
+      1. Detect face in both the reference image and the generated frame.
+      2. For each frame: crop the face region out of the generated frame,
+         warp it to match the face region in the reference image, and blend
+         it in with a soft mask.  Everything outside the face comes from
+         the original photo — zero background drift, original quality.
     """
     import shutil
     import subprocess as sp
 
-    ref = cv2.imread(reference_image)
-    if ref is None:
+    ref_orig = cv2.imread(reference_image)
+    if ref_orig is None:
         logger.warning("composite_face_video: cannot read reference — skipping.")
         shutil.copy(generated_video, output_video)
         return output_video
 
     cap = cv2.VideoCapture(generated_video)
     fps   = float(fps_override) if fps_override else (cap.get(cv2.CAP_PROP_FPS) or 24)
-    W     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    gen_W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    gen_H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Resize reference to match generated video (EchoMimic outputs at target_size)
-    ref = cv2.resize(ref, (W, H), interpolation=cv2.INTER_LANCZOS4)
-
-    # Detect face in the reference image once to build a stable mask.
-    face = _detect_face_opencv(ref)
-    if face is None:
-        logger.warning("composite_face_video: no face detected — skipping composite.")
+    # Read the first frame to detect the face in the generated video
+    ret, first_frame = cap.read()
+    if not ret:
+        logger.warning("composite_face_video: could not read first frame — skipping.")
         cap.release()
         shutil.copy(generated_video, output_video)
         return output_video
+    cap.release()
 
-    fx, fy, fw, fh = face
-    cx = fx + fw // 2
-    # Centre the ellipse slightly below mid-face so it weights toward the mouth.
-    cy = fy + int(fh * 0.55)
+    # --- Detect face in the generated frame (512×512 space) ---
+    gen_face = _detect_face_opencv(first_frame)
+    if gen_face is None:
+        logger.warning("composite_face_video: no face in generated frame — skipping.")
+        shutil.copy(generated_video, output_video)
+        return output_video
+    gfx, gfy, gfw, gfh = gen_face
 
-    # Ellipse covers the full face area.  Generous width/height so cheeks and
-    # chin are fully included; the heavy Gaussian feather makes the edge invisible.
-    mask = np.zeros((H, W), dtype=np.float32)
+    # --- Detect face in the original reference image (native resolution) ---
+    ref_face = _detect_face_opencv(ref_orig)
+    if ref_face is None:
+        logger.warning("composite_face_video: no face in reference image — skipping.")
+        shutil.copy(generated_video, output_video)
+        return output_video
+    rfx, rfy, rfw, rfh = ref_face
+
+    ref_H, ref_W = ref_orig.shape[:2]
+
+    # Padding multiplier: how much context around the face bbox to include in the
+    # composite patch. 0.55 = just over half a face-width of padding on each side.
+    PAD = 0.55
+
+    # --- Source patch coords in generated (512×512) frame ---
+    gpad_x = int(gfw * PAD)
+    gpad_y = int(gfh * PAD)
+    gs_x1 = max(0, gfx - gpad_x)
+    gs_y1 = max(0, gfy - gpad_y)
+    gs_x2 = min(gen_W, gfx + gfw + gpad_x)
+    gs_y2 = min(gen_H, gfy + gfh + gpad_y)
+
+    # --- Destination patch coords in original reference (native res) ---
+    rpad_x = int(rfw * PAD)
+    rpad_y = int(rfh * PAD)
+    rd_x1 = max(0, rfx - rpad_x)
+    rd_y1 = max(0, rfy - rpad_y)
+    rd_x2 = min(ref_W, rfx + rfw + rpad_x)
+    rd_y2 = min(ref_H, rfy + rfh + rpad_y)
+    dest_w = rd_x2 - rd_x1
+    dest_h = rd_y2 - rd_y1
+
+    # --- Build the blend mask in destination patch space ---
+    # Ellipse centred on the lower half of the face (mouth/chin area gets full weight).
+    mask_patch = np.zeros((dest_h, dest_w), dtype=np.float32)
+    mc_x = dest_w // 2
+    mc_y = int(dest_h * 0.45)
     cv2.ellipse(
-        mask,
-        (cx, cy),
-        (max(1, int(fw * 0.80)), max(1, int(fh * 0.90))),
+        mask_patch,
+        (mc_x, mc_y),
+        (max(1, int(dest_w * 0.42)), max(1, int(dest_h * 0.46))),
         0, 0, 360, 1.0, -1,
     )
-    # Feather radius = ~18 % of face width → smooth, invisible seam.
-    feather = max(21, int(fw * 0.36) | 1)   # must be odd
-    mask = cv2.GaussianBlur(mask, (feather, feather), 0)[..., None]
+    feather = max(21, int(dest_w * 0.22) | 1)   # must be odd
+    mask_patch = cv2.GaussianBlur(mask_patch, (feather, feather), 0)[..., None]
+
+    # --- Output is at the reference image's native resolution ---
+    out_W, out_H = ref_W, ref_H
 
     tmp_video = output_video.replace(".mp4", "_noaudio.mp4")
     writer = cv2.VideoWriter(
-        tmp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H)
+        tmp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_W, out_H)
     )
 
-    logger.info(f"Face composite: blending generated face over original for {total} frames…")
-    ref_f = ref.astype(np.float32)
+    logger.info(
+        f"Face composite: {total} frames, gen face {gen_face} → "
+        f"ref face {ref_face}, dest patch {dest_w}×{dest_h}…"
+    )
+
+    ref_f = ref_orig.astype(np.float32)
+
+    # Re-open the video to iterate from frame 0
+    cap = cv2.VideoCapture(generated_video)
     idx = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        # Where mask=1 → take from generated (animated face).
-        # Where mask=0 → take from reference (original background/skin).
-        blended = ref_f * (1.0 - mask) + frame.astype(np.float32) * mask
-        writer.write(np.clip(blended, 0, 255).astype(np.uint8))
+
+        # 1. Start with the original reference photo
+        canvas = ref_f.copy()
+
+        # 2. Crop the face patch from the generated frame and scale to dest size
+        src_patch = frame[gs_y1:gs_y2, gs_x1:gs_x2]
+        src_resized = cv2.resize(src_patch, (dest_w, dest_h), interpolation=cv2.INTER_LANCZOS4)
+
+        # 3. Blend into the reference at the correct location
+        dest_region = canvas[rd_y1:rd_y2, rd_x1:rd_x2]
+        blended_region = (
+            dest_region * (1.0 - mask_patch)
+            + src_resized.astype(np.float32) * mask_patch
+        )
+        canvas[rd_y1:rd_y2, rd_x1:rd_x2] = blended_region
+
+        writer.write(np.clip(canvas, 0, 255).astype(np.uint8))
         idx += 1
         if idx % 96 == 0:
             logger.info(f"  composite {idx}/{total}")
@@ -679,15 +737,36 @@ def stabilize_background(
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
+def _center_square_crop(img: np.ndarray) -> np.ndarray:
+    """
+    Crops the image to a centre square without zooming into the face.
+    Preserves the original framing (person + background) — EchoMimic
+    does its own internal face detection; we must NOT pre-crop to the face.
+    """
+    h, w = img.shape[:2]
+    if h == w:
+        return img
+    side = min(h, w)
+    y0 = (h - side) // 2
+    x0 = (w - side) // 2
+    return img[y0:y0 + side, x0:x0 + side]
+
+
 def preprocess_image(input_path: str, output_path: str) -> str:
     """
-    Full preprocessing pipeline. Reads *input_path*, applies all steps,
-    writes the result to *output_path* and returns *output_path*.
+    Preprocessing pipeline for EchoMimic input.
 
     Steps:
-      1. Smart portrait crop
-      2. GFPGAN face restoration (upscales 2×)
+      1. Centre-square crop  – preserves original framing (no face zoom)
+      2. GFPGAN face restoration (upscales 2×, sharpens face details)
       3. White balance correction
+      4. Resize to 512×512  – EchoMimic's required input resolution
+
+    NOTE: smart_portrait_crop was removed. It cropped tight to the face
+    before EchoMimic, so the model generated a face-zoomed output and the
+    final video looked like a giant close-up. EchoMimic's internal MTCNN
+    handles face detection — our job is just to give it a clean square image
+    at the right resolution with the original framing intact.
     """
     img = cv2.imread(input_path)
     if img is None:
@@ -696,14 +775,17 @@ def preprocess_image(input_path: str, output_path: str) -> str:
     h0, w0 = img.shape[:2]
     logger.info(f"Preprocessing image {input_path} [{w0}×{h0}]")
 
-    # 1. Portrait crop
-    img = smart_portrait_crop(img)
+    # 1. Centre-square crop (no face zoom)
+    img = _center_square_crop(img)
 
-    # 2. GFPGAN restoration (also upscales 2×)
+    # 2. GFPGAN restoration (upscales 2×)
     img = restore_face(img)
 
     # 3. White balance
     img = white_balance(img)
+
+    # 4. Resize to 512×512 for EchoMimic
+    img = cv2.resize(img, (512, 512), interpolation=cv2.INTER_LANCZOS4)
 
     h1, w1 = img.shape[:2]
     logger.info(f"Preprocessed image: [{w0}×{h0}] → [{w1}×{h1}], saved to {output_path}")
