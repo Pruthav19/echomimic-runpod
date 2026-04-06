@@ -1,82 +1,64 @@
 import os
 import sys
-import urllib.request
 from huggingface_hub import snapshot_download
 
-MODEL_DIR = os.environ.get("MODEL_DIR", "/app/models")
+MODEL_DIR = os.environ.get("MODEL_DIR", "/runpod-volume/models")
 
-
-def _has_vae_weights(vae_dir):
-    expected = [
-        os.path.join(vae_dir, "diffusion_pytorch_model.bin"),
-        os.path.join(vae_dir, "diffusion_pytorch_model.safetensors"),
-        os.path.join(vae_dir, "diffusion_pytorch_model.fp16.safetensors"),
-    ]
-    return any(os.path.isfile(path) for path in expected)
 
 def download_models():
-    print(f"📥 Downloading EchoMimic models to {MODEL_DIR}...")
     os.makedirs(MODEL_DIR, exist_ok=True)
+    print(f"Downloading EchoMimicV3-Flash models to {MODEL_DIR}...")
 
-    # 1. Main EchoMimic weights — MUST land directly in MODEL_DIR (not a subdir).
-    #    start.sh symlinks MODEL_DIR → /app/EchoMimic/pretrained_weights, so
-    #    files here map to ./pretrained_weights/<file> as the yaml config expects.
-    snapshot_download(repo_id="BadToBest/EchoMimic", local_dir=MODEL_DIR)
-
-    # 2. SD Image Variations — backbone for the reference UNet
-    snapshot_download(
-        repo_id="lambdalabs/sd-image-variations-diffusers",
-        local_dir=os.path.join(MODEL_DIR, "sd-image-variations-diffusers"),
-    )
-
-    # 3. Stable Diffusion VAE
-    vae_dir = os.path.join(MODEL_DIR, "sd-vae-ft-mse")
-    snapshot_download(repo_id="stabilityai/sd-vae-ft-mse", local_dir=vae_dir)
-
-    if not _has_vae_weights(vae_dir):
-        print("⚠️  VAE weights missing after initial download. Retrying with force_download...")
+    # EchoMimicV3 Flash weights — repo layout:
+    #   echomimicv3-flash-pro/config.json
+    #   echomimicv3-flash-pro/diffusion_pytorch_model.safetensors (fine-tuned weights)
+    flash_dir = os.path.join(MODEL_DIR, "echomimicv3-flash-pro")
+    if not os.path.isfile(
+        os.path.join(flash_dir, "diffusion_pytorch_model.safetensors")
+    ):
+        print("Downloading EchoMimicV3-Flash from HuggingFace...")
         snapshot_download(
-            repo_id="stabilityai/sd-vae-ft-mse",
-            local_dir=vae_dir,
-            force_download=True,
+            repo_id="BadToBest/EchoMimicV3",
+            local_dir=MODEL_DIR,
+            local_dir_use_symlinks=False,
+            allow_patterns=["echomimicv3-flash-pro/**"],
+        )
+        print("EchoMimicV3-Flash downloaded.")
+    else:
+        print("EchoMimicV3-Flash already present.")
+
+    # Base Wan2.1-Fun-V1.1-1.3B-InP model (separate repo, ~19 GB)
+    wan_dir = os.path.join(flash_dir, "Wan2.1-Fun-V1.1-1.3B-InP")
+    if not os.path.isfile(os.path.join(wan_dir, "config.json")):
+        print("Downloading Wan2.1-Fun-V1.1-1.3B-InP base model (~19 GB)...")
+        snapshot_download(
+            repo_id="alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP",
+            local_dir=wan_dir,
             local_dir_use_symlinks=False,
         )
-
-    if not _has_vae_weights(vae_dir):
-        raise RuntimeError(
-            "sd-vae-ft-mse downloaded but no VAE weight file found "
-            "(expected diffusion_pytorch_model.bin or safetensors)."
-        )
-
-    # 4. GFPGAN v1.4 — face restoration weights (input image enhancement)
-    gfpgan_path = os.path.join(MODEL_DIR, "GFPGANv1.4.pth")
-    if not os.path.exists(gfpgan_path):
-        print("⬇️  Downloading GFPGANv1.4.pth…")
-        urllib.request.urlretrieve(
-            "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth",
-            gfpgan_path,
-        )
-        print("✅ GFPGANv1.4.pth downloaded.")
+        print("Wan2.1-Fun-V1.1-1.3B-InP downloaded.")
     else:
-        print("✅ GFPGANv1.4.pth already present.")
+        print("Wan2.1-Fun-V1.1-1.3B-InP already present.")
 
-    # 5. Real-ESRGAN x2 — output video upscaling (512→1024)
-    realesrgan_path = os.path.join(MODEL_DIR, "RealESRGAN_x2plus.pth")
-    if not os.path.exists(realesrgan_path):
-        print("⬇️  Downloading RealESRGAN_x2plus.pth…")
-        urllib.request.urlretrieve(
-            "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
-            realesrgan_path,
+    # chinese-wav2vec2-base audio encoder (separate HuggingFace repo)
+    wav2vec_dir = os.path.join(flash_dir, "chinese-wav2vec2-base")
+    if not os.path.isfile(os.path.join(wav2vec_dir, "config.json")):
+        print("Downloading chinese-wav2vec2-base audio encoder...")
+        snapshot_download(
+            repo_id="TencentGameMate/chinese-wav2vec2-base",
+            local_dir=wav2vec_dir,
+            local_dir_use_symlinks=False,
         )
-        print("✅ RealESRGAN_x2plus.pth downloaded.")
+        print("chinese-wav2vec2-base downloaded.")
     else:
-        print("✅ RealESRGAN_x2plus.pth already present.")
+        print("chinese-wav2vec2-base already present.")
 
-    print("✅ All models downloaded successfully!")
+    print("All models downloaded successfully.")
+
 
 if __name__ == "__main__":
     try:
         download_models()
     except Exception as e:
-        print(f"❌ Download failed: {e}", file=sys.stderr)
+        print(f"Download failed: {e}", file=sys.stderr)
         sys.exit(1)

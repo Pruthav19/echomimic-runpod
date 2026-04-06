@@ -1,28 +1,472 @@
+"""
+EchoMimicV3-Flash RunPod Serverless Handler.
+
+Models are loaded ONCE at first invocation and kept in GPU memory.
+Subsequent jobs on the same worker skip model loading entirely.
+"""
 import os
+import sys
 import uuid
+import math
+import logging
 import subprocess
+
+import numpy as np
+import torch
 import runpod
 import boto3
 import requests
-import yaml
-import logging
-import glob
+import librosa
+from PIL import Image
+from moviepy import VideoFileClip, AudioFileClip
+import pyloudnorm as pyln
 
-from preprocess import preprocess_image, prepare_background_reference, stabilize_background, composite_face_video
+# ── Add EchoMimicV3 to import path ──────────────────────────────
+ECHOMIMIC_DIR = "/app/echomimic_v3"
+sys.path.insert(0, ECHOMIMIC_DIR)
 
+from omegaconf import OmegaConf
+from safetensors.torch import load_file as load_safetensors
+from transformers import AutoTokenizer, Wav2Vec2FeatureExtractor
+from einops import rearrange
+
+from src.wan_vae import AutoencoderKLWan
+from src.wan_image_encoder import CLIPModel
+from src.wan_text_encoder import WanT5EncoderModel
+from src.wan_transformer3d_audio_2512 import (
+    WanTransformerAudioMask3DModel as WanTransformer,
+)
+from src.pipeline_wan_fun_inpaint_audio_2512 import WanFunInpaintAudioPipeline
+from src.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from src.cache_utils import get_teacache_coefficients
+from src.utils import (
+    filter_kwargs,
+    get_image_to_video_latent2,
+    get_image_to_video_latent3,
+    save_videos_grid,
+)
+from src.wav2vec2 import Wav2Vec2Model
+
+# ── Constants ────────────────────────────────────────────────────
 WORKSPACE = "/tmp/workspace"
-ECHOMIMIC_DIR = "/app/EchoMimic"
+MODEL_DIR = os.environ.get("MODEL_DIR", "/runpod-volume/models")
+MODEL_BASE = os.path.join(MODEL_DIR, "echomimicv3-flash-pro")
+MODEL_NAME = os.path.join(MODEL_BASE, "Wan2.1-Fun-V1.1-1.3B-InP")
+TRANSFORMER_PATH = os.path.join(
+    MODEL_BASE, "diffusion_pytorch_model.safetensors"
+)
+WAV2VEC_DIR = os.path.join(MODEL_BASE, "chinese-wav2vec2-base")
+CONFIG_PATH = os.path.join(ECHOMIMIC_DIR, "config", "config.yaml")
+
 S3_BUCKET = os.environ.get("S3_BUCKET", "your-bucket-name")
 S3_REGION = os.environ.get("S3_REGION", "us-east-1")
 S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "")
 S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "")
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.bfloat16
+FPS = 25
+
+# ── Default inference parameters ─────────────────────────────────
+# Tuned for lip-sync precision over raw inference speed:
+#   - num_inference_steps 12: extra refinement steps where mouth detail is rendered
+#   - audio_guidance_scale 2.5: pushes the audio CFG harder than the README's 1.8-2.0
+#     "minimum optimal" range, but below the official run_flash.sh's 3.0
+#   - num_skip_start_steps 12 (== num_inference_steps): TeaCache is initialized but
+#     never fires, so every step runs full computation. Caching the late steps was
+#     freezing audio cross-attention exactly when mouth shapes get refined.
+DEFAULTS = {
+    "num_inference_steps": 12,
+    "guidance_scale": 6.0,
+    "audio_guidance_scale": 2.5,
+    "audio_scale": 1.0,  # NOTE: dead param in upstream pipeline, kept for API parity
+    "sample_size": [768, 768],
+    "seed": 43,
+    "teacache_threshold": 0.1,
+    "num_skip_start_steps": 12,  # == num_inference_steps → TeaCache disabled
+    "riflex_k": 6,
+    "shift": 5.0,
+    "partial_video_length": 81,  # frames per chunk (81 = 3.24s)
+    "overlap_video_length": 8,   # overlap frames between chunks
+    "prompt": "A person is speaking.",
+    "negative_prompt": "",
+}
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MAX_CONTEXT_FRAMES = 32
-DEFAULT_CONTEXT_FRAMES = 16   # EchoMimic temporal attention is trained on 12-16; larger causes jitter
-DEFAULT_CONTEXT_OVERLAP = 8   # 50% of context_frames — critical for smooth seams between windows
+# ═══════════════════════════════════════════════════════════════════
+# Model loading — lazy singleton, loaded once per worker lifetime
+# ═══════════════════════════════════════════════════════════════════
+
+_models = None
+
+
+def _load_models():
+    """Load all EchoMimicV3-Flash models into GPU memory."""
+    logger.info("Loading EchoMimicV3-Flash models (first job on this worker)...")
+
+    config = OmegaConf.load(CONFIG_PATH)
+
+    # ── Audio encoder (wav2vec) ──
+    wav2vec_fe = Wav2Vec2FeatureExtractor.from_pretrained(WAV2VEC_DIR)
+    audio_encoder = Wav2Vec2Model.from_pretrained(WAV2VEC_DIR)
+    audio_encoder = audio_encoder.eval().to(DEVICE)
+    logger.info("Wav2Vec audio encoder loaded.")
+
+    # ── Transformer (with fine-tuned flash weights) ──
+    transformer = WanTransformer.from_pretrained(
+        MODEL_NAME,
+        transformer_additional_kwargs=OmegaConf.to_container(
+            config["transformer_additional_kwargs"]
+        ),
+        low_cpu_mem_usage=True,
+        torch_dtype=DTYPE,
+    )
+    state_dict = load_safetensors(TRANSFORMER_PATH)
+    m, u = transformer.load_state_dict(state_dict, strict=False)
+    logger.info(f"Transformer loaded (missing={len(m)}, unexpected={len(u)}).")
+
+    # ── VAE ──
+    vae = AutoencoderKLWan.from_pretrained(
+        os.path.join(
+            MODEL_NAME, config["vae_kwargs"].get("vae_subpath", "vae")
+        ),
+        additional_kwargs=OmegaConf.to_container(config["vae_kwargs"]),
+    ).to(DTYPE)
+    logger.info("VAE loaded.")
+
+    # ── Tokenizer + Text encoder ──
+    tokenizer = AutoTokenizer.from_pretrained(
+        os.path.join(
+            MODEL_NAME,
+            config["text_encoder_kwargs"].get("tokenizer_subpath", "tokenizer"),
+        ),
+    )
+    text_encoder = WanT5EncoderModel.from_pretrained(
+        os.path.join(
+            MODEL_NAME,
+            config["text_encoder_kwargs"].get(
+                "text_encoder_subpath", "text_encoder"
+            ),
+        ),
+        additional_kwargs=OmegaConf.to_container(config["text_encoder_kwargs"]),
+        low_cpu_mem_usage=True,
+        torch_dtype=DTYPE,
+    ).eval()
+    logger.info("Text encoder loaded.")
+
+    # ── CLIP Image encoder ──
+    clip_image_encoder = CLIPModel.from_pretrained(
+        os.path.join(
+            MODEL_NAME,
+            config["image_encoder_kwargs"].get(
+                "image_encoder_subpath", "image_encoder"
+            ),
+        ),
+    ).to(DTYPE).eval()
+    logger.info("CLIP image encoder loaded.")
+
+    # ── Scheduler ──
+    sched_kwargs = OmegaConf.to_container(config["scheduler_kwargs"])
+    sched_kwargs["shift"] = 1  # required for Flow_Unipc
+    scheduler = FlowUniPCMultistepScheduler(
+        **filter_kwargs(FlowUniPCMultistepScheduler, sched_kwargs)
+    )
+
+    # ── Pipeline ──
+    pipeline = WanFunInpaintAudioPipeline(
+        transformer=transformer,
+        vae=vae,
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scheduler=scheduler,
+        clip_image_encoder=clip_image_encoder,
+    ).to(device=DEVICE)
+
+    # ── TeaCache initialization ──
+    # We initialize TeaCache so the transformer's caching hooks exist, but
+    # we set num_skip_start_steps == num_inference_steps which means the cache
+    # never fires. This is intentional: caching the late steps was freezing
+    # audio cross-attention exactly when mouth shapes get refined, hurting
+    # lip sync precision. Full computation on every step is the production
+    # tradeoff.
+    coefficients = get_teacache_coefficients(MODEL_NAME)
+    if coefficients is not None:
+        pipeline.transformer.enable_teacache(
+            coefficients,
+            DEFAULTS["num_inference_steps"],
+            DEFAULTS["teacache_threshold"],
+            num_skip_start_steps=DEFAULTS["num_skip_start_steps"],
+            offload=False,
+        )
+        if DEFAULTS["num_skip_start_steps"] >= DEFAULTS["num_inference_steps"]:
+            logger.info(
+                "TeaCache initialized but disabled "
+                "(num_skip_start_steps == num_inference_steps) "
+                "for lip sync precision."
+            )
+        else:
+            logger.info(
+                f"TeaCache enabled (skips first "
+                f"{DEFAULTS['num_skip_start_steps']} of "
+                f"{DEFAULTS['num_inference_steps']} steps)."
+            )
+
+    logger.info("All models loaded. Worker is ready.")
+    return {
+        "pipeline": pipeline,
+        "vae": vae,
+        "wav2vec_fe": wav2vec_fe,
+        "audio_encoder": audio_encoder,
+        "config": config,
+    }
+
+
+def get_models():
+    global _models
+    if _models is None:
+        _models = _load_models()
+    return _models
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Audio / video helper functions
+# ═══════════════════════════════════════════════════════════════════
+
+
+def loudness_norm(audio_array, sr=16000, lufs=-23):
+    """Normalize audio to target LUFS (EchoMimicV3's expected level)."""
+    meter = pyln.Meter(sr)
+    loudness = meter.integrated_loudness(audio_array)
+    if abs(loudness) > 100:
+        return audio_array
+    return pyln.normalize.loudness(audio_array, loudness, lufs)
+
+
+def get_audio_embed(mel_input, wav2vec_fe, audio_encoder, video_length, sr=16000):
+    """Extract wav2vec audio embeddings aligned to video frames."""
+    audio_feature = np.squeeze(
+        wav2vec_fe(mel_input, sampling_rate=sr).input_values
+    )
+    audio_feature = torch.from_numpy(audio_feature).float().to(device=DEVICE)
+    audio_feature = audio_feature.unsqueeze(0)
+
+    with torch.no_grad():
+        embeddings = audio_encoder(
+            audio_feature, seq_len=int(video_length), output_hidden_states=True
+        )
+
+    audio_emb = torch.stack(embeddings.hidden_states[1:], dim=1).squeeze(0)
+    audio_emb = rearrange(audio_emb, "b s d -> s b d")
+    return audio_emb.cpu().detach()
+
+
+def align_to_vae(length, vae):
+    """Align video length to VAE temporal compression ratio."""
+    if length <= 1:
+        return 1
+    tcr = vae.config.temporal_compression_ratio
+    return int((length - 1) // tcr * tcr) + 1
+
+
+def get_sample_size(pil_img, sample_size):
+    """Compute output resolution aligned to 16px, capped at sample_size area."""
+    w, h = pil_img.size
+    ori_a = w * h
+    default_a = sample_size[0] * sample_size[1]
+    if default_a < ori_a:
+        ratio = math.sqrt(ori_a / default_a)
+        w = int(w / ratio) // 16 * 16
+        h = int(h / ratio) // 16 * 16
+    else:
+        w = w // 16 * 16
+        h = h // 16 * 16
+    return [int(h), int(w)]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Inference — chunked for arbitrary-length audio
+# ═══════════════════════════════════════════════════════════════════
+
+
+def run_echomimic_v3(image_path, audio_path, job_dir, user_params):
+    """
+    Generate a talking-head video from a portrait image and audio.
+    Processes audio in chunks of partial_video_length frames with overlap
+    blending for seamless long-video output.
+    """
+    models = get_models()
+    pipeline = models["pipeline"]
+    vae = models["vae"]
+    wav2vec_fe = models["wav2vec_fe"]
+    audio_encoder = models["audio_encoder"]
+
+    # Merge user params with defaults
+    p = {**DEFAULTS, **{k: v for k, v in user_params.items() if k in DEFAULTS}}
+    seed = int(p["seed"])
+    partial_len = int(p["partial_video_length"])
+    overlap_len = int(p["overlap_video_length"])
+
+    # ── Load image ──
+    ref_image = Image.open(image_path).convert("RGB")
+    sample_h, sample_w = get_sample_size(ref_image, p["sample_size"])
+    logger.info(f"Output resolution: {sample_w}x{sample_h}")
+
+    # ── Load & normalize audio ──
+    mel_input, sr = librosa.load(audio_path, sr=16000)
+    mel_input = loudness_norm(mel_input, sr)
+
+    audio_clip = AudioFileClip(audio_path)
+    total_video_length = align_to_vae(int(audio_clip.duration * FPS), vae)
+    logger.info(f"Total video: {total_video_length} frames ({total_video_length/FPS:.1f}s)")
+
+    # Trim audio to match video length
+    mel_trimmed = mel_input[: int(total_video_length / FPS * sr)]
+
+    # Full audio embeddings
+    audio_emb_full = get_audio_embed(
+        mel_trimmed, wav2vec_fe, audio_encoder, total_video_length
+    )
+    audio_embeds = audio_emb_full.unsqueeze(0).to(device=DEVICE, dtype=DTYPE)
+
+    # ── Build frame indices for audio embeddings ──
+    indices = (torch.arange(2 * 2 + 1) - 2) * 1
+    center_indices = (
+        torch.arange(0, total_video_length, 1).unsqueeze(1) + indices.unsqueeze(0)
+    )
+    center_indices = torch.clamp(center_indices, min=0, max=audio_embeds.shape[1] - 1)
+    audio_embeds = audio_embeds[:, center_indices.squeeze()]
+    if audio_embeds.dim() == 3:
+        audio_embeds = audio_embeds.unsqueeze(0)
+
+    # ── RiFlex for long sequences ──
+    partial_len_aligned = align_to_vae(partial_len, vae)
+    latent_frames = (partial_len_aligned - 1) // vae.config.temporal_compression_ratio + 1
+    pipeline.transformer.enable_riflex(k=int(p["riflex_k"]), L_test=latent_frames)
+
+    prompt = p["prompt"]
+    negative_prompt = p["negative_prompt"]
+
+    generator = torch.Generator(device=DEVICE).manual_seed(seed)
+
+    # ── Chunked generation with overlap blending ──
+    # current_ref tracks the reference frames for the next chunk.
+    # For the first chunk it's the original portrait.
+    # For subsequent chunks it's the last overlap_len frames of the previous
+    # chunk — this eliminates the visual "reset to original" that causes flicker.
+    current_ref = ref_image
+    new_sample = None
+    init_frames = 0
+
+    while init_frames < total_video_length:
+        remaining = total_video_length - init_frames
+        chunk_len = min(partial_len_aligned, remaining)
+        chunk_len = align_to_vae(chunk_len, vae)
+        if chunk_len <= 0:
+            break
+
+        # First chunk: use get_image_to_video_latent2 (single PIL image).
+        # Subsequent chunks: use get_image_to_video_latent3 which accepts a
+        # list of PIL images as the start reference.
+        if init_frames == 0:
+            input_video, input_video_mask, clip_image = get_image_to_video_latent2(
+                current_ref, None,
+                video_length=chunk_len,
+                sample_size=[sample_h, sample_w],
+            )
+        else:
+            input_video, input_video_mask, clip_image = get_image_to_video_latent3(
+                current_ref, None,
+                video_length=chunk_len,
+                sample_size=[sample_h, sample_w],
+            )
+
+        # Slice audio embeddings for this chunk
+        chunk_audio = audio_embeds[:, init_frames: init_frames + chunk_len]
+
+        sample = pipeline(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            num_frames=chunk_len,
+            audio_embeds=chunk_audio,
+            audio_scale=float(p["audio_scale"]),
+            ip_mask=None,
+            use_un_ip_mask=False,
+            height=sample_h,
+            width=sample_w,
+            generator=generator,
+            neg_scale=1.0,
+            neg_steps=0,
+            use_dynamic_cfg=False,
+            use_dynamic_acfg=False,
+            guidance_scale=float(p["guidance_scale"]),
+            audio_guidance_scale=float(p["audio_guidance_scale"]),
+            num_inference_steps=int(p["num_inference_steps"]),
+            video=input_video,
+            mask_video=input_video_mask,
+            clip_image=clip_image,
+            cfg_skip_ratio=0.0,
+            shift=float(p["shift"]),
+        ).videos
+
+        # Blend with previous chunk using linear crossfade
+        if init_frames != 0 and new_sample is not None:
+            mix = torch.from_numpy(
+                np.array(
+                    [float(i) / float(overlap_len) for i in range(overlap_len)],
+                    np.float32,
+                )
+            ).unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            new_sample[:, :, -overlap_len:] = (
+                new_sample[:, :, -overlap_len:] * (1 - mix)
+                + sample[:, :, :overlap_len] * mix
+            )
+            new_sample = torch.cat(
+                [new_sample, sample[:, :, overlap_len:]], dim=2
+            )
+        else:
+            new_sample = sample
+
+        # Update reference to last overlap_len frames of this chunk so the
+        # next chunk starts from the actual generated face position/expression.
+        current_ref = [
+            Image.fromarray(
+                (sample[0, :, i].permute(1, 2, 0).clamp(0, 1) * 255)
+                .byte().cpu().numpy()
+            )
+            for i in range(-overlap_len, 0)
+        ]
+
+        init_frames += chunk_len - overlap_len
+        if init_frames + overlap_len >= total_video_length:
+            break
+
+    # ── Save video ──
+    tmp_video = os.path.join(job_dir, "tmp_output.mp4")
+    save_videos_grid(
+        new_sample[:, :, :total_video_length], tmp_video, fps=FPS
+    )
+
+    # ── Mux audio onto video with high-quality encoding ──
+    output_video = os.path.join(job_dir, "output.mp4")
+    video_clip = VideoFileClip(tmp_video)
+    audio_clip_trimmed = audio_clip.subclipped(0, total_video_length / FPS)
+    video_clip = video_clip.with_audio(audio_clip_trimmed)
+    video_clip.write_videofile(
+        output_video, codec="libx264", audio_codec="aac", threads=2
+    )
+    video_clip.close()
+    audio_clip.close()
+    os.remove(tmp_video)
+
+    return output_video
+
+
+# ═══════════════════════════════════════════════════════════════════
+# S3 helpers
+# ═══════════════════════════════════════════════════════════════════
+
 
 def get_s3_client():
     return boto3.client(
@@ -32,6 +476,7 @@ def get_s3_client():
         region_name=S3_REGION,
     )
 
+
 def download_file(url, dest_path):
     response = requests.get(url, stream=True, timeout=120)
     response.raise_for_status()
@@ -40,242 +485,67 @@ def download_file(url, dest_path):
             f.write(chunk)
     return dest_path
 
+
 def upload_to_s3(local_path, s3_key):
     s3 = get_s3_client()
-    s3.upload_file(local_path, S3_BUCKET, s3_key, ExtraArgs={"ContentType": "video/mp4"})
-    url = s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": s3_key}, ExpiresIn=3600)
-    return url
-
-
-def _resolve_temporal_window(user_params):
-    requested_frames = int(user_params.get("context_frames", DEFAULT_CONTEXT_FRAMES))
-    requested_overlap = int(user_params.get("context_overlap", DEFAULT_CONTEXT_OVERLAP))
-
-    if requested_frames < 1:
-        logger.warning("context_frames=%s is invalid; using default %s.", requested_frames, DEFAULT_CONTEXT_FRAMES)
-        requested_frames = DEFAULT_CONTEXT_FRAMES
-
-    if requested_frames > MAX_CONTEXT_FRAMES:
-        logger.warning(
-            "context_frames=%s exceeds EchoMimic's supported maximum of %s; clamping.",
-            requested_frames,
-            MAX_CONTEXT_FRAMES,
-        )
-        requested_frames = MAX_CONTEXT_FRAMES
-
-    max_overlap = max(0, requested_frames - 1)
-    if requested_overlap < 0:
-        logger.warning("context_overlap=%s is invalid; using default %s.", requested_overlap, DEFAULT_CONTEXT_OVERLAP)
-        requested_overlap = DEFAULT_CONTEXT_OVERLAP
-
-    if requested_overlap > max_overlap:
-        logger.warning(
-            "context_overlap=%s is too large for context_frames=%s; clamping to %s.",
-            requested_overlap,
-            requested_frames,
-            max_overlap,
-        )
-        requested_overlap = max_overlap
-
-    return requested_frames, requested_overlap
-
-def preprocess_audio(input_path: str, output_path: str) -> str:
-    """
-    Normalise and resample audio to exactly what EchoMimic's Whisper model expects:
-      • Mono (1 channel)
-      • 16 000 Hz sample rate
-      • loudnorm to -14 LUFS (prevents Whisper from being driven by silence or clipping)
-    A bad sample rate / stereo mix / wrong loudness are the main causes of
-    lip-sync drift.
-    """
-    result = subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", input_path,
-            "-ac", "1",              # mono
-            "-ar", "16000",          # 16 kHz — Whisper's native rate
-            "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",  # broadcast loudness norm
-            "-c:a", "pcm_s16le",     # 16-bit PCM WAV
-            output_path,
-        ],
-        capture_output=True, text=True,
+    s3.upload_file(
+        local_path,
+        S3_BUCKET,
+        s3_key,
+        ExtraArgs={"ContentType": "video/mp4"},
     )
-    if result.returncode != 0:
-        logger.warning(f"Audio preprocessing failed: {result.stderr} — using original.")
-        import shutil
-        shutil.copy(input_path, output_path)
-    else:
-        logger.info(f"Audio preprocessed: mono 16kHz loudnorm → {output_path}")
-    return output_path
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": s3_key},
+        ExpiresIn=3600,
+    )
 
 
-def run_echomimic(image_path, audio_path, output_dir, user_params):
-    """Dynamically generates a YAML config overriding defaults with API input."""
-    
-    # 1. Load the default animation config so we keep all the correct internal model paths
-    default_config_path = os.path.join(ECHOMIMIC_DIR, "configs", "prompts", "animation.yaml")
-    with open(default_config_path, "r") as f:
-        config_data = yaml.safe_load(f)
+# ═══════════════════════════════════════════════════════════════════
+# RunPod handler
+# ═══════════════════════════════════════════════════════════════════
 
-    # 2. Inject the specific job image and audio
-    config_data["test_cases"] = {
-        image_path: [audio_path]
-    }
-    
-    # 3. Apply user tweaks dynamically
-    # Maps your custom API keys to EchoMimic's internal config keys
-    if "inference_steps" in user_params:
-        config_data["steps"] = int(user_params["inference_steps"])
-    if "cfg_scale" in user_params:
-        config_data["cfg"] = float(user_params["cfg_scale"])
-    if "face_expand_ratio" in user_params:
-        config_data["facemask_ratio"] = float(user_params["face_expand_ratio"])
-    if "target_size" in user_params:
-        config_data["W"] = int(user_params["target_size"])
-        config_data["H"] = int(user_params["target_size"])
-    if "fps" in user_params:
-        config_data["fps"] = int(user_params["fps"])
-    if "seed" in user_params:
-        config_data["seed"] = int(user_params["seed"])
-        
-    # Inject weights into the config (only active if you switch to infer_audio2vid_pose.py)
-    if "pose_weight" in user_params:
-        config_data["pose_weight"] = float(user_params["pose_weight"])
-    if "face_weight" in user_params:
-        config_data["face_weight"] = float(user_params["face_weight"])
-    if "lip_weight" in user_params:
-        config_data["lip_weight"] = float(user_params["lip_weight"])
-
-    # 4. Save the modified config for this specific job
-    job_config_path = os.path.join(output_dir, "job_config.yaml")
-    with open(job_config_path, "w") as f:
-        yaml.dump(config_data, f)
-
-    # 5. Run EchoMimic Inference
-    # infer_audio2vid.py reads ALL visual params from CLI args, NOT the yaml config.
-    w    = int(user_params.get("target_size",       512))
-    h    = int(user_params.get("target_size",       512))
-    steps = int(user_params.get("inference_steps",   50))
-    cfg  = float(user_params.get("cfg_scale",        3.0))  # 2.5=too mushy/no motion; 3.5=stiff; 3.0 is the sweet spot
-    fps  = int(user_params.get("fps",                24))
-    seed = int(user_params.get("seed",               42))
-    # EchoMimic's temporal positional encoding supports up to 32 frames.
-    # Larger values crash inside the motion module regardless of available VRAM.
-    ctx_frames, ctx_overlap = _resolve_temporal_window(user_params)
-
-    # facecrop_dilation_ratio: how much padding around the face box for the reference crop
-    #   0.5 = default (tight); 1.2 = generous shoulder/hair room
-    facecrop_dilation = float(user_params.get("face_expand_ratio",    0.5))
-
-    # facemusk_dilation_ratio: padding around the face bbox for the animated mask.
-    #   0.05 adds slight extra coverage so mouth corners aren't clipped at the mask edge.
-    #   Increase to 0.1 if corners still clip; lower to 0.0 if mask bleeds into chin/neck.
-    facemask_dilation = float(user_params.get("face_mask_dilation",   0.1))
-
-    cmd = [
-        "python", "-u", "infer_audio2vid.py",
-        "--config", job_config_path,
-        "-W",       str(w),
-        "-H",       str(h),
-        "--steps",  str(steps),
-        "--cfg",    str(cfg),
-        "--fps",    str(fps),
-        "--seed",   str(seed),
-        "--context_frames",        str(ctx_frames),
-        "--context_overlap",       str(ctx_overlap),
-        "--sample_rate",           "16000",
-        "--facecrop_dilation_ratio", str(facecrop_dilation),
-        "--facemusk_dilation_ratio", str(facemask_dilation),
-    ]
-
-    logger.info(f"Running EchoMimic with config: {config_data}")
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=ECHOMIMIC_DIR)
-
-    if result.returncode != 0:
-        logger.error(f"EchoMimic STDERR: {result.stderr}")
-        raise RuntimeError(f"EchoMimic inference failed: {result.stderr}")
-
-    # 6. Locate the generated output video
-    mp4_files = glob.glob(os.path.join(ECHOMIMIC_DIR, "output", "**", "*.mp4"), recursive=True)
-    if not mp4_files:
-        raise RuntimeError("EchoMimic finished but no mp4 was found!")
-    
-    generated_video = max(mp4_files, key=os.path.getctime)
-    return generated_video
 
 def handler(event):
     try:
         input_data = event.get("input", {})
-        background_lock = float(input_data.get("background_lock", 0.0))
-        job_id = str(uuid.uuid4())[:8]
-        job_dir = os.path.join(WORKSPACE, job_id)
-        os.makedirs(job_dir, exist_ok=True)
 
         if not input_data.get("avatar_image_url") or not input_data.get("audio_url"):
             return {"error": "avatar_image_url and audio_url are required"}
 
-        # 1. Download Inputs
-        raw_image_path  = os.path.join(job_dir, "avatar_raw.png")
-        image_path      = os.path.join(job_dir, "avatar.png")
-        background_ref_path = os.path.join(job_dir, "avatar_bg_ref.png")
-        audio_path      = os.path.join(job_dir, "audio.wav")
-        download_file(input_data["avatar_image_url"], raw_image_path)
+        job_id = str(uuid.uuid4())[:8]
+        job_dir = os.path.join(WORKSPACE, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+
+        # ── 1. Download inputs ──
+        image_path = os.path.join(job_dir, "avatar.png")
+        audio_path = os.path.join(job_dir, "audio.wav")
+
+        download_file(input_data["avatar_image_url"], image_path)
         download_file(input_data["audio_url"], audio_path)
 
-        if background_lock > 0.0:
-            prepare_background_reference(raw_image_path, background_ref_path)
+        # ── 2. Preprocess audio (16kHz mono WAV) ──
+        processed_audio = os.path.join(job_dir, "audio_16k.wav")
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                processed_audio,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        audio_path = processed_audio
 
-        # 1b. Preprocess audio: resample to 16kHz mono + loudnorm
-        #     This is the primary fix for lip-sync drift.
-        processed_audio_path = os.path.join(job_dir, "audio_processed.wav")
-        audio_path = preprocess_audio(audio_path, processed_audio_path)
+        # ── 3. Run EchoMimicV3-Flash inference ──
+        final_video = run_echomimic_v3(
+            image_path, audio_path, job_dir, input_data
+        )
 
-        # 1c. Preprocess image for maximum quality
-        #     • Smart portrait crop   → proper talking-head framing
-        #     • GFPGAN v1.4 restore   → sharpen/enhance face details (2× upscale)
-        #     • White-balance fix     → neutralise colour casts
-        skip_preprocess = input_data.get("skip_preprocess", False)
-        if skip_preprocess:
-            import shutil
-            shutil.copy(raw_image_path, image_path)
-            logger.info("Image preprocessing skipped (skip_preprocess=true).")
-        else:
-            preprocess_image(raw_image_path, image_path)
+        # ── 4. Upload to S3 ──
+        s3_key = f"echomimic_v3/{job_id}.mp4"
+        video_url = upload_to_s3(final_video, s3_key)
 
-        # 2. Run Generation
-        final_video_path = run_echomimic(image_path, audio_path, job_dir, input_data)
-
-        # 2b. Face composite: paste only the animated face back onto the original
-        #     reference image per frame.  This is the key HeyGen-style step —
-        #     the diffusion model never touches the background, so there is zero
-        #     drift and the original image quality is preserved everywhere except
-        #     the mouth/face region.
-        #     We use raw_image_path (original download) as the background so the
-        #     composite has full-resolution, unprocessed background quality.
-        skip_composite = input_data.get("skip_composite", False)
-        if not skip_composite:
-            composite_path = os.path.join(job_dir, "output_composite.mp4")
-            final_video_path = composite_face_video(
-                final_video_path,
-                raw_image_path,
-                composite_path,
-                fps_override=float(input_data.get("fps", 24)),
-            )
-
-        # 2c. Post-process: Real-ESRGAN 2× upscale (512→1024) + H.264 CRF 16
-        skip_enhance = input_data.get("skip_enhance", False)
-        if not skip_enhance:
-            from preprocess import enhance_video
-            enhanced_path = os.path.join(job_dir, "output_enhanced.mp4")
-            final_video_path = enhance_video(final_video_path, enhanced_path)
-
-        if not isinstance(final_video_path, (str, os.PathLike)):
-            raise RuntimeError(f"Invalid final video path returned: {final_video_path!r}")
-
-        # 3. Upload to S3
-        s3_key = f"echomimic_videos/{job_id}.mp4"
-        video_url = upload_to_s3(final_video_path, s3_key)
-
-        # Cleanup
         subprocess.run(["rm", "-rf", job_dir], capture_output=True)
 
         return {
@@ -287,6 +557,7 @@ def handler(event):
     except Exception as e:
         logger.exception("Handler error")
         return {"error": str(e), "status": "failed"}
+
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -sL \"https://huggingface.co/fudan-generative-ai/hallo2/tree/main\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/fudan-generative-vision/hallo2/main/README.md\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/fudan-generative-vision/hallo2/main/hallo/utils/util.py\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/fudan-generative-vision/hallo2/main/hallo/datasets/image_processor.py\")",
+      "WebSearch",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:antgroup.github.io)",
+      "WebFetch(domain:fal.ai)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/antgroup/echomimic_v3/main/README.md\")",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/antgroup/echomimic_v3/main/requirements.txt\")",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/antgroup/echomimic_v3/main/run_flash.sh\")"
+    ]
+  }
+}
