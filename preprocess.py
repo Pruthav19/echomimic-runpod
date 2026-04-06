@@ -68,42 +68,61 @@ def _get_restorer():
 def _detect_face_opencv(img_bgr: np.ndarray):
     """
     Returns (x, y, w, h) of the largest detected face, or None.
-    Uses OpenCV's built-in DNN face detector (more robust than Haar cascades).
-    Falls back to Haar if the DNN weights are not present.
+    Haar cascade with strict parameters to avoid false positives on
+    backgrounds (bookshelves, windows, etc.).
+    minNeighbors=8 and minSize proportional to image size prevent spurious detections.
     """
-    # Try DNN detector first (ships with opencv-python-headless / opencv-python)
-    prototxt = cv2.data.haarcascades + "../dnn/deploy.prototext"  # may not exist
-    modelfile = cv2.data.haarcascades + "../dnn/res10_300x300_ssd_iter_140000_fp16.caffemodel"
-
-    if os.path.exists(prototxt) and os.path.exists(modelfile):
-        net = cv2.dnn.readNetFromCaffe(prototxt, modelfile)
-        h, w = img_bgr.shape[:2]
-        blob = cv2.dnn.blobFromImage(
-            cv2.resize(img_bgr, (300, 300)), 1.0, (300, 300),
-            (104.0, 177.0, 123.0)
-        )
-        net.setInput(blob)
-        detections = net.forward()
-        best, best_conf = None, 0.5
-        for i in range(detections.shape[2]):
-            conf = detections[0, 0, i, 2]
-            if conf > best_conf:
-                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                x1, y1, x2, y2 = box.astype(int)
-                best = (x1, y1, x2 - x1, y2 - y1)
-                best_conf = conf
-        if best:
-            return best
-
-    # Haar fallback
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = img_bgr.shape[:2]
+    min_face = max(80, min(h, w) // 6)   # face must be at least 1/6 of image
     face_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     )
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+    faces = face_cascade.detectMultiScale(
+        gray, scaleFactor=1.1, minNeighbors=8, minSize=(min_face, min_face)
+    )
     if len(faces) == 0:
         return None
     return max(faces, key=lambda f: f[2] * f[3])  # largest face
+
+
+def _detect_face_mediapipe(img_bgr: np.ndarray):
+    """
+    MediaPipe face detection — far more reliable than Haar for portraits.
+    Returns (x, y, w, h) or None.
+    model_selection=1 is the full-range model (handles far and close faces).
+    """
+    try:
+        import mediapipe as mp
+        h, w = img_bgr.shape[:2]
+        mp_fd = mp.solutions.face_detection
+        with mp_fd.FaceDetection(model_selection=1, min_detection_confidence=0.5) as det:
+            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            result = det.process(rgb)
+            if not result.detections:
+                return None
+            best = max(result.detections, key=lambda d: d.score[0])
+            bb = best.location_data.relative_bounding_box
+            x  = max(0, int(bb.xmin * w))
+            y  = max(0, int(bb.ymin * h))
+            fw = min(w - x, int(bb.width  * w))
+            fh = min(h - y, int(bb.height * h))
+            return (x, y, fw, fh)
+    except Exception as e:
+        logger.warning(f"MediaPipe face detection failed: {e}")
+        return None
+
+
+def _detect_face(img_bgr: np.ndarray):
+    """
+    Best-effort face detection: MediaPipe first (reliable), Haar fallback.
+    Returns (x, y, w, h) or None.
+    """
+    face = _detect_face_mediapipe(img_bgr)
+    if face is not None:
+        return face
+    logger.warning("MediaPipe returned no face — falling back to Haar cascade.")
+    return _detect_face_opencv(img_bgr)
 
 
 def smart_portrait_crop(img_bgr: np.ndarray) -> np.ndarray:
@@ -321,7 +340,7 @@ def _realesrgan_upscale(input_video_path: str, output_video_path: str) -> str:
         enhanced, _ = upsampler.enhance(frame, outscale=2)
 
         if idx % 48 == 0:
-            cached_face = _detect_face_opencv(enhanced)
+            cached_face = _detect_face(enhanced)
             if idx > 0:
                 logger.info(f"  {idx}/{total} frames upscaled")
 
@@ -401,17 +420,16 @@ def composite_face_video(
     fps_override: float | None = None,
 ) -> str:
     """
-    HeyGen-style face composite.
+    HeyGen-style face composite — mouth-only animation blended onto the original image.
 
-    The generated video (512×512, from EchoMimic) is always face-zoomed.
-    The reference image is the original photo at its native resolution.
-
-    Strategy:
-      1. Detect face in both the reference image and the generated frame.
-      2. For each frame: crop the face region out of the generated frame,
-         warp it to match the face region in the reference image, and blend
-         it in with a soft mask.  Everything outside the face comes from
-         the original photo — zero background drift, original quality.
+    Key design decisions:
+    - Uses MediaPipe for face detection (Haar cascade was detecting bookshelves/objects).
+    - Only blends the MOUTH ZONE (nose-to-chin): the only region EchoMimic animates.
+      The full-face composite caused a visible "pasted face" artifact because skin tone,
+      lighting, and sharpness differed outside the mouth area.
+    - Reinhard color transfer in Lab space ensures the animated mouth matches the
+      original skin tone exactly.
+    - Output is capped at 1024px to keep RealESRGAN from OOMing on large source images.
     """
     import shutil
     import subprocess as sp
@@ -422,93 +440,104 @@ def composite_face_video(
         shutil.copy(generated_video, output_video)
         return output_video
 
+    # Cap reference to 1024px on the longer side — prevents OOM in subsequent ESRGAN step
+    MAX_DIM = 1024
+    ref_H0, ref_W0 = ref_orig.shape[:2]
+    if max(ref_H0, ref_W0) > MAX_DIM:
+        scale = MAX_DIM / max(ref_H0, ref_W0)
+        ref_orig = cv2.resize(
+            ref_orig,
+            (int(ref_W0 * scale), int(ref_H0 * scale)),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+        logger.info(f"Reference resized {ref_W0}×{ref_H0} → {ref_orig.shape[1]}×{ref_orig.shape[0]}")
+
+    ref_H, ref_W = ref_orig.shape[:2]
+
     cap = cv2.VideoCapture(generated_video)
     fps   = float(fps_override) if fps_override else (cap.get(cv2.CAP_PROP_FPS) or 24)
     gen_W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     gen_H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Read the first frame to detect the face in the generated video
     ret, first_frame = cap.read()
     if not ret:
-        logger.warning("composite_face_video: could not read first frame — skipping.")
+        logger.warning("composite_face_video: empty video — skipping.")
         cap.release()
         shutil.copy(generated_video, output_video)
         return output_video
     cap.release()
 
-    # --- Detect face in the generated frame (512×512 space) ---
-    gen_face = _detect_face_opencv(first_frame)
-    if gen_face is None:
-        logger.warning("composite_face_video: no face in generated frame — skipping.")
-        shutil.copy(generated_video, output_video)
-        return output_video
-    gfx, gfy, gfw, gfh = gen_face
+    # ── Face detection with MediaPipe (reliable), Haar fallback ──────────────
+    gen_face = _detect_face(first_frame)
+    ref_face = _detect_face(ref_orig)
 
-    # --- Detect face in the original reference image (native resolution) ---
-    ref_face = _detect_face_opencv(ref_orig)
-    if ref_face is None:
-        logger.warning("composite_face_video: no face in reference image — skipping.")
+    if gen_face is None or ref_face is None:
+        logger.warning(
+            f"composite_face_video: detection failed (gen={gen_face}, ref={ref_face}) — skipping."
+        )
         shutil.copy(generated_video, output_video)
         return output_video
+
+    gfx, gfy, gfw, gfh = gen_face
     rfx, rfy, rfw, rfh = ref_face
 
-    ref_H, ref_W = ref_orig.shape[:2]
+    logger.info(f"  gen face: {gen_face}  ref face: {ref_face}")
 
-    # Padding multiplier: how much context around the face bbox to include in the
-    # composite patch. 0.55 = just over half a face-width of padding on each side.
-    PAD = 0.55
+    # ── Mouth zone in generated 512×512 frame ────────────────────────────────
+    # From 48% of face height (just below nose) to 108% (chin + small pad).
+    # Horizontal: face width + 10% pad each side so corners aren't clipped.
+    G_Y1 = max(0,     gfy + int(gfh * 0.48))
+    G_Y2 = min(gen_H, gfy + int(gfh * 1.08))
+    G_X1 = max(0,     gfx - int(gfw * 0.10))
+    G_X2 = min(gen_W, gfx + gfw + int(gfw * 0.10))
 
-    # --- Source patch coords in generated (512×512) frame ---
-    gpad_x = int(gfw * PAD)
-    gpad_y = int(gfh * PAD)
-    gs_x1 = max(0, gfx - gpad_x)
-    gs_y1 = max(0, gfy - gpad_y)
-    gs_x2 = min(gen_W, gfx + gfw + gpad_x)
-    gs_y2 = min(gen_H, gfy + gfh + gpad_y)
+    # ── Corresponding mouth zone in reference image ───────────────────────────
+    R_Y1 = max(0,     rfy + int(rfh * 0.48))
+    R_Y2 = min(ref_H, rfy + int(rfh * 1.08))
+    R_X1 = max(0,     rfx - int(rfw * 0.10))
+    R_X2 = min(ref_W, rfx + rfw + int(rfw * 0.10))
 
-    # --- Destination patch coords in original reference (native res) ---
-    rpad_x = int(rfw * PAD)
-    rpad_y = int(rfh * PAD)
-    rd_x1 = max(0, rfx - rpad_x)
-    rd_y1 = max(0, rfy - rpad_y)
-    rd_x2 = min(ref_W, rfx + rfw + rpad_x)
-    rd_y2 = min(ref_H, rfy + rfh + rpad_y)
-    dest_w = rd_x2 - rd_x1
-    dest_h = rd_y2 - rd_y1
+    dest_w = R_X2 - R_X1
+    dest_h = R_Y2 - R_Y1
 
-    # --- Build the blend mask in destination patch space ---
-    # Ellipse centred on the face, stopping well above the collar.
-    # fh * 0.55 vertical radius means the mask reaches ~chin bottom at most —
-    # it does NOT extend into the shirt/collar, preventing the halo artifact.
-    mask_patch = np.zeros((dest_h, dest_w), dtype=np.float32)
-    mc_x = dest_w // 2
-    mc_y = int(dest_h * 0.38)   # slightly above centre → keeps bottom above collar
+    if dest_w <= 4 or dest_h <= 4:
+        logger.warning("composite_face_video: mouth zone too small — skipping.")
+        shutil.copy(generated_video, output_video)
+        return output_video
+
+    # ── Soft blend mask — ellipse centred in the mouth patch ─────────────────
+    # Full weight at the mouth centre, zero at all patch edges.
+    # Heavy feathering (35% of patch size) makes the boundary invisible.
+    mask = np.zeros((dest_h, dest_w), dtype=np.float32)
     cv2.ellipse(
-        mask_patch,
-        (mc_x, mc_y),
-        (max(1, int(dest_w * 0.40)), max(1, int(dest_h * 0.38))),
+        mask,
+        (dest_w // 2, dest_h // 2),
+        (max(1, int(dest_w * 0.40)), max(1, int(dest_h * 0.44))),
         0, 0, 360, 1.0, -1,
     )
-    feather = max(21, int(dest_w * 0.28) | 1)   # heavy feather = invisible seam
-    mask_patch = cv2.GaussianBlur(mask_patch, (feather, feather), 0)[..., None]
+    feather = max(21, int(min(dest_w, dest_h) * 0.35) | 1)
+    mask = cv2.GaussianBlur(mask, (feather, feather), 0)[..., None]
 
-    # --- Output is at the reference image's native resolution ---
     out_W, out_H = ref_W, ref_H
-
     tmp_video = output_video.replace(".mp4", "_noaudio.mp4")
     writer = cv2.VideoWriter(
         tmp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_W, out_H)
     )
 
     logger.info(
-        f"Face composite: {total} frames, gen face {gen_face} → "
-        f"ref face {ref_face}, dest patch {dest_w}×{dest_h}…"
+        f"Composite: mouth zone gen=({G_X1},{G_Y1})→({G_X2},{G_Y2}) "
+        f"ref=({R_X1},{R_Y1})→({R_X2},{R_Y2}) patch={dest_w}×{dest_h} frames={total}"
     )
 
     ref_f = ref_orig.astype(np.float32)
+    # Compute Reinhard stats from the reference mouth region once (stable across frames)
+    ref_mouth_region = ref_orig[R_Y1:R_Y2, R_X1:R_X2]
+    ref_lab_stats = []
+    ref_lab_patch = cv2.cvtColor(ref_mouth_region, cv2.COLOR_BGR2Lab).astype(np.float32)
+    for ch in range(3):
+        ref_lab_stats.append((ref_lab_patch[:, :, ch].mean(), ref_lab_patch[:, :, ch].std() + 1e-6))
 
-    # Re-open the video to iterate from frame 0
     cap = cv2.VideoCapture(generated_video)
     idx = 0
     while True:
@@ -516,37 +545,30 @@ def composite_face_video(
         if not ret:
             break
 
-        # 1. Start with the original reference photo
+        # 1. Canvas = original reference
         canvas = ref_f.copy()
 
-        # 2. Crop the face patch from the generated frame and scale to dest size
-        src_patch = frame[gs_y1:gs_y2, gs_x1:gs_x2]
-        src_resized = cv2.resize(src_patch, (dest_w, dest_h), interpolation=cv2.INTER_LANCZOS4)
+        # 2. Crop mouth from generated frame, scale to ref mouth size
+        src_crop = frame[G_Y1:G_Y2, G_X1:G_X2]
+        if src_crop.size == 0:
+            writer.write(np.clip(canvas, 0, 255).astype(np.uint8))
+            idx += 1
+            continue
+        src_scaled = cv2.resize(src_crop, (dest_w, dest_h), interpolation=cv2.INTER_LANCZOS4)
 
-        # 3. Color-match the generated patch to the reference skin tone.
-        #    Reinhard color transfer (per-channel mean+std shift in Lab space)
-        #    removes any diffusion-model color cast before blending.
-        dest_region = canvas[rd_y1:rd_y2, rd_x1:rd_x2].astype(np.uint8)
-        src_lab = cv2.cvtColor(src_resized, cv2.COLOR_BGR2Lab).astype(np.float32)
-        ref_lab = cv2.cvtColor(dest_region, cv2.COLOR_BGR2Lab).astype(np.float32)
+        # 3. Reinhard color transfer: shift generated Lab stats to match reference
+        src_lab = cv2.cvtColor(src_scaled, cv2.COLOR_BGR2Lab).astype(np.float32)
         for ch in range(3):
-            src_std = src_lab[:, :, ch].std() + 1e-6
-            ref_std = ref_lab[:, :, ch].std() + 1e-6
-            src_lab[:, :, ch] = (
-                (src_lab[:, :, ch] - src_lab[:, :, ch].mean())
-                * (ref_std / src_std)
-                + ref_lab[:, :, ch].mean()
-            )
-        src_matched = cv2.cvtColor(
-            np.clip(src_lab, 0, 255).astype(np.uint8), cv2.COLOR_Lab2BGR
-        )
+            ref_mean, ref_std = ref_lab_stats[ch]
+            src_ch = src_lab[:, :, ch]
+            src_lab[:, :, ch] = (src_ch - src_ch.mean()) * (ref_std / (src_ch.std() + 1e-6)) + ref_mean
+        src_matched = cv2.cvtColor(np.clip(src_lab, 0, 255).astype(np.uint8), cv2.COLOR_Lab2BGR)
 
-        # 4. Blend color-matched patch into the reference
-        blended_region = (
-            dest_region.astype(np.float32) * (1.0 - mask_patch)
-            + src_matched.astype(np.float32) * mask_patch
+        # 4. Blend into canvas
+        ref_region = canvas[R_Y1:R_Y2, R_X1:R_X2]
+        canvas[R_Y1:R_Y2, R_X1:R_X2] = (
+            ref_region * (1.0 - mask) + src_matched.astype(np.float32) * mask
         )
-        canvas[rd_y1:rd_y2, rd_x1:rd_x2] = blended_region
 
         writer.write(np.clip(canvas, 0, 255).astype(np.uint8))
         idx += 1
@@ -621,7 +643,7 @@ def stabilize_background(
         return output_video_path
 
     reference = cv2.resize(reference, (frame_w, frame_h), interpolation=cv2.INTER_CUBIC)
-    face = _detect_face_opencv(reference)
+    face = _detect_face(reference)
     if face is None:
         logger.warning("Background lock skipped: no face detected in reference image.")
         cap.release()
