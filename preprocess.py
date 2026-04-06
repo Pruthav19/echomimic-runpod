@@ -394,6 +394,111 @@ def enhance_video(input_video_path: str, output_video_path: str) -> str:
         return output_video_path
 
 
+def composite_face_video(
+    generated_video: str,
+    reference_image: str,
+    output_video: str,
+    fps_override: float | None = None,
+) -> str:
+    """
+    HeyGen-style face composite.
+
+    For every frame of the generated video:
+      1. Keep the original reference image as the background (zero drift).
+      2. Blend ONLY the animated face region from the generated frame back in,
+         using a soft elliptical mask so there is no hard seam.
+
+    This is the single biggest quality gap vs HeyGen: they never let the
+    diffusion model touch the background.  The result is a perfectly clean
+    background with a naturally animated lower face.
+    """
+    import shutil
+    import subprocess as sp
+
+    ref = cv2.imread(reference_image)
+    if ref is None:
+        logger.warning("composite_face_video: cannot read reference — skipping.")
+        shutil.copy(generated_video, output_video)
+        return output_video
+
+    cap = cv2.VideoCapture(generated_video)
+    fps   = float(fps_override) if fps_override else (cap.get(cv2.CAP_PROP_FPS) or 24)
+    W     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Resize reference to match generated video (EchoMimic outputs at target_size)
+    ref = cv2.resize(ref, (W, H), interpolation=cv2.INTER_LANCZOS4)
+
+    # Detect face in the reference image once to build a stable mask.
+    face = _detect_face_opencv(ref)
+    if face is None:
+        logger.warning("composite_face_video: no face detected — skipping composite.")
+        cap.release()
+        shutil.copy(generated_video, output_video)
+        return output_video
+
+    fx, fy, fw, fh = face
+    cx = fx + fw // 2
+    # Centre the ellipse slightly below mid-face so it weights toward the mouth.
+    cy = fy + int(fh * 0.55)
+
+    # Ellipse covers the full face area.  Generous width/height so cheeks and
+    # chin are fully included; the heavy Gaussian feather makes the edge invisible.
+    mask = np.zeros((H, W), dtype=np.float32)
+    cv2.ellipse(
+        mask,
+        (cx, cy),
+        (max(1, int(fw * 0.80)), max(1, int(fh * 0.90))),
+        0, 0, 360, 1.0, -1,
+    )
+    # Feather radius = ~18 % of face width → smooth, invisible seam.
+    feather = max(21, int(fw * 0.36) | 1)   # must be odd
+    mask = cv2.GaussianBlur(mask, (feather, feather), 0)[..., None]
+
+    tmp_video = output_video.replace(".mp4", "_noaudio.mp4")
+    writer = cv2.VideoWriter(
+        tmp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H)
+    )
+
+    logger.info(f"Face composite: blending generated face over original for {total} frames…")
+    ref_f = ref.astype(np.float32)
+    idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        # Where mask=1 → take from generated (animated face).
+        # Where mask=0 → take from reference (original background/skin).
+        blended = ref_f * (1.0 - mask) + frame.astype(np.float32) * mask
+        writer.write(np.clip(blended, 0, 255).astype(np.uint8))
+        idx += 1
+        if idx % 96 == 0:
+            logger.info(f"  composite {idx}/{total}")
+
+    cap.release()
+    writer.release()
+
+    sp.run(
+        [
+            "ffmpeg", "-y",
+            "-i", tmp_video,
+            "-i", generated_video,
+            "-c:v", "libx264", "-crf", "16", "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-shortest",
+            output_video,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    os.remove(tmp_video)
+    logger.info(f"Face composite done → {output_video}")
+    return output_video
+
+
 def stabilize_background(
     input_video_path: str,
     reference_image_path: str,

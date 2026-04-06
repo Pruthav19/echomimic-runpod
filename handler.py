@@ -8,7 +8,7 @@ import yaml
 import logging
 import glob
 
-from preprocess import preprocess_image, prepare_background_reference, stabilize_background
+from preprocess import preprocess_image, prepare_background_reference, stabilize_background, composite_face_video
 
 WORKSPACE = "/tmp/workspace"
 ECHOMIMIC_DIR = "/app/EchoMimic"
@@ -154,7 +154,7 @@ def run_echomimic(image_path, audio_path, output_dir, user_params):
     # infer_audio2vid.py reads ALL visual params from CLI args, NOT the yaml config.
     w    = int(user_params.get("target_size",       512))
     h    = int(user_params.get("target_size",       512))
-    steps = int(user_params.get("inference_steps",   40))
+    steps = int(user_params.get("inference_steps",   50))
     cfg  = float(user_params.get("cfg_scale",        3.0))  # 2.5=too mushy/no motion; 3.5=stiff; 3.0 is the sweet spot
     fps  = int(user_params.get("fps",                24))
     seed = int(user_params.get("seed",               42))
@@ -244,16 +244,18 @@ def handler(event):
         # 2. Run Generation
         final_video_path = run_echomimic(image_path, audio_path, job_dir, input_data)
 
-        # 2b. Optional background stabilization for static-avatar use cases.
-        #     Helps reduce drifting/changing backgrounds by blending non-face
-        #     regions back toward the original reference image.
-        if background_lock > 0.0:
-            locked_path = os.path.join(job_dir, "output_bg_locked.mp4")
-            final_video_path = stabilize_background(
+        # 2b. Face composite: paste only the animated face back onto the original
+        #     reference image per frame.  This is the key HeyGen-style step —
+        #     the diffusion model never touches the background, so there is zero
+        #     drift and the original image quality is preserved everywhere except
+        #     the mouth/face region.  background_lock is no longer needed.
+        skip_composite = input_data.get("skip_composite", False)
+        if not skip_composite:
+            composite_path = os.path.join(job_dir, "output_composite.mp4")
+            final_video_path = composite_face_video(
                 final_video_path,
-                background_ref_path,
-                locked_path,
-                lock_strength=background_lock,
+                image_path,
+                composite_path,
                 fps_override=float(input_data.get("fps", 24)),
             )
 
