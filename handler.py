@@ -1,5 +1,9 @@
 """
-EchoMimicV3-Flash RunPod Serverless Handler.
+EchoMimicV3-Preview RunPod Serverless Handler.
+
+Uses the full (non-distilled) EchoMimicV3 transformer weights for higher-fidelity
+lip sync. The Flash variant trades refinement quality for speed via consistency
+distillation; for production use we run the Preview model at 25 denoising steps.
 
 Models are loaded ONCE at first invocation and kept in GPU memory.
 Subsequent jobs on the same worker skip model loading entirely.
@@ -50,10 +54,12 @@ from src.wav2vec2 import Wav2Vec2Model
 # ── Constants ────────────────────────────────────────────────────
 WORKSPACE = "/tmp/workspace"
 MODEL_DIR = os.environ.get("MODEL_DIR", "/runpod-volume/models")
-MODEL_BASE = os.path.join(MODEL_DIR, "echomimicv3-flash-pro")
+MODEL_BASE = os.path.join(MODEL_DIR, "echomimicv3-preview")
 MODEL_NAME = os.path.join(MODEL_BASE, "Wan2.1-Fun-V1.1-1.3B-InP")
+# Preview transformer weights live under transformer/ (not at the Base root
+# like Flash did). ~3.41 GB — full model, trained for 25 denoising steps.
 TRANSFORMER_PATH = os.path.join(
-    MODEL_BASE, "diffusion_pytorch_model.safetensors"
+    MODEL_BASE, "transformer", "diffusion_pytorch_model.safetensors"
 )
 WAV2VEC_DIR = os.path.join(MODEL_BASE, "chinese-wav2vec2-base")
 CONFIG_PATH = os.path.join(ECHOMIMIC_DIR, "config", "config.yaml")
@@ -68,22 +74,27 @@ DTYPE = torch.bfloat16
 FPS = 25
 
 # ── Default inference parameters ─────────────────────────────────
-# Tuned for lip-sync precision over raw inference speed:
-#   - num_inference_steps 12: extra refinement steps where mouth detail is rendered
-#   - audio_guidance_scale 2.5: pushes the audio CFG harder than the README's 1.8-2.0
-#     "minimum optimal" range, but below the official run_flash.sh's 3.0
-#   - num_skip_start_steps 12 (== num_inference_steps): TeaCache is initialized but
-#     never fires, so every step runs full computation. Caching the late steps was
-#     freezing audio cross-attention exactly when mouth shapes get refined.
+# Aligned with the official EchoMimicV3 infer_preview.py for full-model quality:
+#   - num_inference_steps 25: Preview is trained for 25 steps (Flash was
+#     distilled to 8). More refinement budget = more precise mouth shapes.
+#   - guidance_scale 4.0: was 6.0 — high text CFG was overriding audio signal.
+#     Lowering gives audio cross-attention more authority over lip shape.
+#   - audio_guidance_scale 2.9: matches infer_preview.py's recommended value.
+#   - neg_scale 1.5, neg_steps 2: negative CFG scaling applied during the
+#     first 2 steps (structure phase). These were disabled in our Flash config.
+#   - num_skip_start_steps 25 (== num_inference_steps): TeaCache initialized
+#     but never fires. Full computation every step for maximum fidelity.
 DEFAULTS = {
-    "num_inference_steps": 12,
-    "guidance_scale": 6.0,
-    "audio_guidance_scale": 2.5,
+    "num_inference_steps": 25,
+    "guidance_scale": 4.0,
+    "audio_guidance_scale": 2.9,
+    "neg_scale": 1.5,
+    "neg_steps": 2,
     "audio_scale": 1.0,  # NOTE: dead param in upstream pipeline, kept for API parity
     "sample_size": [768, 768],
     "seed": 43,
     "teacache_threshold": 0.1,
-    "num_skip_start_steps": 12,  # == num_inference_steps → TeaCache disabled
+    "num_skip_start_steps": 25,  # == num_inference_steps → TeaCache disabled
     "riflex_k": 6,
     "shift": 5.0,
     "partial_video_length": 81,  # frames per chunk (81 = 3.24s)
@@ -103,8 +114,8 @@ _models = None
 
 
 def _load_models():
-    """Load all EchoMimicV3-Flash models into GPU memory."""
-    logger.info("Loading EchoMimicV3-Flash models (first job on this worker)...")
+    """Load all EchoMimicV3-Preview models into GPU memory."""
+    logger.info("Loading EchoMimicV3-Preview models (first job on this worker)...")
 
     config = OmegaConf.load(CONFIG_PATH)
 
@@ -114,7 +125,7 @@ def _load_models():
     audio_encoder = audio_encoder.eval().to(DEVICE)
     logger.info("Wav2Vec audio encoder loaded.")
 
-    # ── Transformer (with fine-tuned flash weights) ──
+    # ── Transformer (with Preview full-model weights) ──
     transformer = WanTransformer.from_pretrained(
         MODEL_NAME,
         transformer_additional_kwargs=OmegaConf.to_container(
@@ -396,8 +407,8 @@ def run_echomimic_v3(image_path, audio_path, job_dir, user_params):
             height=sample_h,
             width=sample_w,
             generator=generator,
-            neg_scale=1.0,
-            neg_steps=0,
+            neg_scale=float(p["neg_scale"]),
+            neg_steps=int(p["neg_steps"]),
             use_dynamic_cfg=False,
             use_dynamic_acfg=False,
             guidance_scale=float(p["guidance_scale"]),
