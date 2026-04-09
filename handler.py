@@ -1,12 +1,15 @@
 """
-EchoMimicV3-Preview RunPod Serverless Handler.
+EchoMimicV3-Flash + LatentSync RunPod Serverless Handler.
 
-Uses the full (non-distilled) EchoMimicV3 transformer weights for higher-fidelity
-lip sync. The Flash variant trades refinement quality for speed via consistency
-distillation; for production use we run the Preview model at 25 denoising steps.
+Two-stage pipeline:
+  1. EchoMimicV3-Flash  — generates the talking-head video (visual quality,
+                           head motion, eye blinks, identity preservation)
+  2. LatentSync 1.6      — post-processes the video to refine lip sync
+                           (runs in a separate venv to avoid dependency
+                           conflicts: torch 2.5.1 vs torch 2.2.2)
 
-Models are loaded ONCE at first invocation and kept in GPU memory.
-Subsequent jobs on the same worker skip model loading entirely.
+Models are loaded ONCE at first invocation (EchoMimicV3) and kept in GPU
+memory. LatentSync runs as a subprocess per job using its own Python venv.
 """
 import os
 import sys
@@ -54,15 +57,23 @@ from src.wav2vec2 import Wav2Vec2Model
 # ── Constants ────────────────────────────────────────────────────
 WORKSPACE = "/tmp/workspace"
 MODEL_DIR = os.environ.get("MODEL_DIR", "/runpod-volume/models")
-MODEL_BASE = os.path.join(MODEL_DIR, "echomimicv3-preview")
+MODEL_BASE = os.path.join(MODEL_DIR, "echomimicv3-flash-pro")
 MODEL_NAME = os.path.join(MODEL_BASE, "Wan2.1-Fun-V1.1-1.3B-InP")
-# Preview transformer weights live under transformer/ (not at the Base root
-# like Flash did). ~3.41 GB — full model, trained for 25 denoising steps.
 TRANSFORMER_PATH = os.path.join(
-    MODEL_BASE, "transformer", "diffusion_pytorch_model.safetensors"
+    MODEL_BASE, "diffusion_pytorch_model.safetensors"
 )
 WAV2VEC_DIR = os.path.join(MODEL_BASE, "chinese-wav2vec2-base")
 CONFIG_PATH = os.path.join(ECHOMIMIC_DIR, "config", "config.yaml")
+
+# ── LatentSync constants ─────────────────────────────────────────
+# LatentSync runs as a subprocess using its own isolated Python venv.
+# It expects checkpoints at /app/latentsync/checkpoints/ (relative to CWD).
+# We symlink that directory to the network volume at runtime.
+LATENTSYNC_DIR = "/app/latentsync"
+LATENTSYNC_PYTHON = "/app/latentsync_env/bin/python"
+LATENTSYNC_CKPT_DIR = os.path.join(MODEL_DIR, "latentsync")
+LATENTSYNC_UNET = os.path.join(LATENTSYNC_CKPT_DIR, "latentsync_unet.pt")
+LATENTSYNC_CONFIG = "configs/unet/stage2_512.yaml"
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "your-bucket-name")
 S3_REGION = os.environ.get("S3_REGION", "us-east-1")
@@ -73,38 +84,72 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.bfloat16
 FPS = 25
 
-# ── Default inference parameters ─────────────────────────────────
-# Aligned with the official EchoMimicV3 infer_preview.py for full-model quality:
-#   - num_inference_steps 25: Preview is trained for 25 steps (Flash was
-#     distilled to 8). More refinement budget = more precise mouth shapes.
-#   - guidance_scale 4.0: was 6.0 — high text CFG was overriding audio signal.
-#     Lowering gives audio cross-attention more authority over lip shape.
-#   - audio_guidance_scale 2.9: matches infer_preview.py's recommended value.
-#   - neg_scale 1.5, neg_steps 2: negative CFG scaling applied during the
-#     first 2 steps (structure phase). These were disabled in our Flash config.
-#   - num_skip_start_steps 25 (== num_inference_steps): TeaCache initialized
-#     but never fires. Full computation every step for maximum fidelity.
+# ── Default inference parameters (EchoMimicV3-Flash) ─────────────
+# Flash is designed for 8-step fast inference with good visual quality.
+# Lip sync is handled by LatentSync (post-processing), so we tune these
+# for visual fidelity and smooth motion — not lip tracking.
 DEFAULTS = {
-    "num_inference_steps": 25,
-    "guidance_scale": 4.0,
-    "audio_guidance_scale": 2.9,
-    "neg_scale": 1.5,
-    "neg_steps": 2,
+    "num_inference_steps": 8,
+    "guidance_scale": 6.0,
+    "audio_guidance_scale": 2.5,
+    "neg_scale": 1.0,
+    "neg_steps": 0,
     "audio_scale": 1.0,  # NOTE: dead param in upstream pipeline, kept for API parity
     "sample_size": [768, 768],
     "seed": 43,
     "teacache_threshold": 0.1,
-    "num_skip_start_steps": 25,  # == num_inference_steps → TeaCache disabled
+    "num_skip_start_steps": 8,   # == num_inference_steps → TeaCache disabled
     "riflex_k": 6,
     "shift": 5.0,
-    "partial_video_length": 81,  # frames per chunk (81 = 3.24s)
-    "overlap_video_length": 8,   # overlap frames between chunks
+    "partial_video_length": 81,  # frames per chunk (81 = 3.24s @ 25fps)
+    "overlap_video_length": 8,   # overlap frames blended between chunks
     "prompt": "A person is speaking.",
     "negative_prompt": "",
+    # LatentSync post-processing parameters (per-request tunable)
+    "latentsync_steps": 20,       # denoising steps for LatentSync (20 = default)
+    "latentsync_guidance": 1.5,   # CFG scale for LatentSync
+    "latentsync_enabled": True,   # set False to skip LatentSync for debugging
 }
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════════════════
+# LatentSync symlink setup (done once at process startup)
+# ═══════════════════════════════════════════════════════════════════
+
+_latentsync_ready = False
+
+
+def _ensure_latentsync_checkpoints():
+    """
+    LatentSync's inference script hardcodes 'checkpoints/whisper/tiny.pt'
+    relative to its CWD (/app/latentsync). We create a symlink from
+    /app/latentsync/checkpoints → MODEL_DIR/latentsync so the script
+    finds its weights on the network volume without copying 3GB into the image.
+    """
+    global _latentsync_ready
+    if _latentsync_ready:
+        return
+
+    ckpt_link = os.path.join(LATENTSYNC_DIR, "checkpoints")
+    if os.path.islink(ckpt_link):
+        # Already a symlink — verify it points to the right place
+        if os.readlink(ckpt_link) == LATENTSYNC_CKPT_DIR:
+            _latentsync_ready = True
+            return
+        os.remove(ckpt_link)
+
+    if os.path.isdir(ckpt_link):
+        # Shouldn't happen in a clean container, but be safe
+        logger.warning("checkpoints/ exists as a real dir — skipping symlink")
+        _latentsync_ready = True
+        return
+
+    os.symlink(LATENTSYNC_CKPT_DIR, ckpt_link)
+    logger.info(f"LatentSync checkpoints symlinked: {ckpt_link} → {LATENTSYNC_CKPT_DIR}")
+    _latentsync_ready = True
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Model loading — lazy singleton, loaded once per worker lifetime
@@ -114,8 +159,8 @@ _models = None
 
 
 def _load_models():
-    """Load all EchoMimicV3-Preview models into GPU memory."""
-    logger.info("Loading EchoMimicV3-Preview models (first job on this worker)...")
+    """Load all EchoMimicV3-Flash models into GPU memory."""
+    logger.info("Loading EchoMimicV3-Flash models (first job on this worker)...")
 
     config = OmegaConf.load(CONFIG_PATH)
 
@@ -125,7 +170,7 @@ def _load_models():
     audio_encoder = audio_encoder.eval().to(DEVICE)
     logger.info("Wav2Vec audio encoder loaded.")
 
-    # ── Transformer (with Preview full-model weights) ──
+    # ── Transformer (Flash fine-tuned weights) ──
     transformer = WanTransformer.from_pretrained(
         MODEL_NAME,
         transformer_additional_kwargs=OmegaConf.to_container(
@@ -196,12 +241,8 @@ def _load_models():
     ).to(device=DEVICE)
 
     # ── TeaCache initialization ──
-    # We initialize TeaCache so the transformer's caching hooks exist, but
-    # we set num_skip_start_steps == num_inference_steps which means the cache
-    # never fires. This is intentional: caching the late steps was freezing
-    # audio cross-attention exactly when mouth shapes get refined, hurting
-    # lip sync precision. Full computation on every step is the production
-    # tradeoff.
+    # num_skip_start_steps == num_inference_steps → cache never fires.
+    # Full computation on every step preserves audio cross-attention signal.
     coefficients = get_teacache_coefficients(MODEL_NAME)
     if coefficients is not None:
         pipeline.transformer.enable_teacache(
@@ -211,20 +252,12 @@ def _load_models():
             num_skip_start_steps=DEFAULTS["num_skip_start_steps"],
             offload=False,
         )
-        if DEFAULTS["num_skip_start_steps"] >= DEFAULTS["num_inference_steps"]:
-            logger.info(
-                "TeaCache initialized but disabled "
-                "(num_skip_start_steps == num_inference_steps) "
-                "for lip sync precision."
-            )
-        else:
-            logger.info(
-                f"TeaCache enabled (skips first "
-                f"{DEFAULTS['num_skip_start_steps']} of "
-                f"{DEFAULTS['num_inference_steps']} steps)."
-            )
+        logger.info(
+            "TeaCache initialized but disabled "
+            "(num_skip_start_steps == num_inference_steps)."
+        )
 
-    logger.info("All models loaded. Worker is ready.")
+    logger.info("EchoMimicV3-Flash models loaded. Worker is ready.")
     return {
         "pipeline": pipeline,
         "vae": vae,
@@ -297,6 +330,59 @@ def get_sample_size(pil_img, sample_size):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# LatentSync post-processing
+# ═══════════════════════════════════════════════════════════════════
+
+
+def run_latentsync(base_video, audio_path, output_path, job_dir, p):
+    """
+    Refine lip sync on base_video using LatentSync 1.6.
+
+    Runs as a subprocess using the isolated /app/latentsync_env Python venv
+    to avoid torch/diffusers version conflicts with EchoMimicV3's environment.
+
+    LatentSync expects its model checkpoints at checkpoints/ relative to its
+    CWD. We create a one-time symlink from /app/latentsync/checkpoints to
+    the network volume directory where the weights were downloaded.
+    """
+    _ensure_latentsync_checkpoints()
+
+    temp_dir = os.path.join(job_dir, "latentsync_temp")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    cmd = [
+        LATENTSYNC_PYTHON, "-m", "scripts.inference",
+        "--unet_config_path", LATENTSYNC_CONFIG,
+        "--inference_ckpt_path", LATENTSYNC_UNET,
+        "--video_path", base_video,
+        "--audio_path", audio_path,
+        "--video_out_path", output_path,
+        "--temp_dir", temp_dir,
+        "--inference_steps", str(int(p["latentsync_steps"])),
+        "--guidance_scale", str(float(p["latentsync_guidance"])),
+        "--enable_deepcache",
+    ]
+
+    logger.info(f"Running LatentSync lip sync refinement → {output_path}")
+    result = subprocess.run(
+        cmd,
+        cwd=LATENTSYNC_DIR,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        logger.error(f"LatentSync stderr:\n{result.stderr}")
+        raise RuntimeError(
+            f"LatentSync failed (exit {result.returncode}). "
+            "See logs for details."
+        )
+
+    logger.info("LatentSync completed successfully.")
+    return output_path
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Inference — chunked for arbitrary-length audio
 # ═══════════════════════════════════════════════════════════════════
 
@@ -362,10 +448,6 @@ def run_echomimic_v3(image_path, audio_path, job_dir, user_params):
     generator = torch.Generator(device=DEVICE).manual_seed(seed)
 
     # ── Chunked generation with overlap blending ──
-    # current_ref tracks the reference frames for the next chunk.
-    # For the first chunk it's the original portrait.
-    # For subsequent chunks it's the last overlap_len frames of the previous
-    # chunk — this eliminates the visual "reset to original" that causes flicker.
     current_ref = ref_image
     new_sample = None
     init_frames = 0
@@ -377,9 +459,6 @@ def run_echomimic_v3(image_path, audio_path, job_dir, user_params):
         if chunk_len <= 0:
             break
 
-        # First chunk: use get_image_to_video_latent2 (single PIL image).
-        # Subsequent chunks: use get_image_to_video_latent3 which accepts a
-        # list of PIL images as the start reference.
         if init_frames == 0:
             input_video, input_video_mask, clip_image = get_image_to_video_latent2(
                 current_ref, None,
@@ -393,7 +472,6 @@ def run_echomimic_v3(image_path, audio_path, job_dir, user_params):
                 sample_size=[sample_h, sample_w],
             )
 
-        # Slice audio embeddings for this chunk
         chunk_audio = audio_embeds[:, init_frames: init_frames + chunk_len]
 
         sample = pipeline(
@@ -439,8 +517,7 @@ def run_echomimic_v3(image_path, audio_path, job_dir, user_params):
         else:
             new_sample = sample
 
-        # Update reference to last overlap_len frames of this chunk so the
-        # next chunk starts from the actual generated face position/expression.
+        # Update reference to last overlap_len frames of this chunk
         current_ref = [
             Image.fromarray(
                 (sample[0, :, i].permute(1, 2, 0).clamp(0, 1) * 255)
@@ -459,19 +536,19 @@ def run_echomimic_v3(image_path, audio_path, job_dir, user_params):
         new_sample[:, :, :total_video_length], tmp_video, fps=FPS
     )
 
-    # ── Mux audio onto video with high-quality encoding ──
-    output_video = os.path.join(job_dir, "output.mp4")
+    # ── Mux audio onto video ──
+    base_video = os.path.join(job_dir, "base_output.mp4")
     video_clip = VideoFileClip(tmp_video)
     audio_clip_trimmed = audio_clip.subclipped(0, total_video_length / FPS)
     video_clip = video_clip.with_audio(audio_clip_trimmed)
     video_clip.write_videofile(
-        output_video, codec="libx264", audio_codec="aac", threads=2
+        base_video, codec="libx264", audio_codec="aac", threads=2
     )
     video_clip.close()
     audio_clip.close()
     os.remove(tmp_video)
 
-    return output_video
+    return base_video, p
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -548,12 +625,20 @@ def handler(event):
         )
         audio_path = processed_audio
 
-        # ── 3. Run EchoMimicV3-Flash inference ──
-        final_video = run_echomimic_v3(
+        # ── 3. Stage 1: EchoMimicV3-Flash — generate base talking-head video ──
+        base_video, p = run_echomimic_v3(
             image_path, audio_path, job_dir, input_data
         )
 
-        # ── 4. Upload to S3 ──
+        # ── 4. Stage 2: LatentSync — refine lip sync on the generated video ──
+        if p.get("latentsync_enabled", True):
+            final_video = os.path.join(job_dir, "output_synced.mp4")
+            run_latentsync(base_video, audio_path, final_video, job_dir, p)
+        else:
+            logger.info("LatentSync disabled via payload — skipping.")
+            final_video = base_video
+
+        # ── 5. Upload to S3 ──
         s3_key = f"echomimic_v3/{job_id}.mp4"
         video_url = upload_to_s3(final_video, s3_key)
 
