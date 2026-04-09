@@ -103,8 +103,22 @@ DEFAULTS = {
     "shift": 5.0,
     "partial_video_length": 81,  # frames per chunk (81 = 3.24s @ 25fps)
     "overlap_video_length": 8,   # overlap frames blended between chunks
-    "prompt": "A person is speaking.",
-    "negative_prompt": "",
+    # Prompt and negative_prompt feed T5 text encoder → cross-attention in
+    # the transformer. This is EchoMimicV3's documented control surface for
+    # motion/expression. The positive prompt describes *desired* dynamics;
+    # the negative prompt (combined via CFG since guidance_scale > 1) pushes
+    # the model *away* from static / stiff outputs. Adapted from official
+    # infer_preview.py negative prompt.
+    "prompt": (
+        "A person is speaking expressively with natural head movements, "
+        "lively facial expressions, engaged eye contact, and frequent "
+        "natural eye blinks."
+    ),
+    "negative_prompt": (
+        "static, stiff, frozen, motionless, expressionless, blank stare, "
+        "no blinking, unnatural, robotic, rigid posture, bad hands, "
+        "twisted fingers, blurry, low quality."
+    ),
     # LatentSync post-processing parameters (per-request tunable)
     "latentsync_steps": 20,       # denoising steps for LatentSync (20 = default)
     "latentsync_guidance": 1.5,   # CFG scale for LatentSync
