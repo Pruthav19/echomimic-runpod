@@ -111,12 +111,11 @@ DEFAULTS = {
     # infer_preview.py negative prompt.
     "prompt": (
         "A person is speaking expressively with natural head movements, "
-        "lively facial expressions, engaged eye contact, and frequent "
-        "natural eye blinks."
+        "lively facial expressions, and engaged eye contact."
     ),
     "negative_prompt": (
         "static, stiff, frozen, motionless, expressionless, blank stare, "
-        "no blinking, unnatural, robotic, rigid posture, bad hands, "
+        "unnatural, robotic, rigid posture, bad hands, "
         "twisted fingers, blurry, low quality."
     ),
     # LatentSync post-processing parameters (per-request tunable)
