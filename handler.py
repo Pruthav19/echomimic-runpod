@@ -119,16 +119,17 @@ DEFAULTS = {
     # the negative prompt (combined via CFG since guidance_scale > 1) pushes
     # the model *away* from static / stiff outputs. Adapted from official
     # infer_preview.py negative prompt.
-    # Prompt kept minimal. Earlier versions with "engaged eye contact" and
-    # "lively facial expressions" were pushing the model toward rapid
-    # blinking and over-animated faces, especially in later chunks where
-    # the effect compounds. Let the model use its default motion priors.
-    "prompt": "A person is speaking naturally.",
-    "negative_prompt": (
-        "static, stiff, frozen, motionless, expressionless, blank stare, "
-        "unnatural, robotic, rigid posture, bad hands, "
-        "twisted fingers, blurry, low quality, rapid blinking, twitching."
-    ),
+    # Keep prompts minimal — matches the original run_flash.sh default.
+    # The model was trained on real talking-head videos; its natural motion
+    # priors (blink rate, head movement, facial expression) are already good.
+    # Any descriptive prompt language ("expressive", "engaged eye contact")
+    # disrupted the priors. Any negative language about eyes ("blank stare",
+    # "rapid blinking") caused the CFG to suppress blinks entirely for most
+    # of the video, then dump them at the end where the signal escapes.
+    # Don't fight the model — let its priors drive motion; LatentSync
+    # handles lip sync independently.
+    "prompt": "A person is speaking.",
+    "negative_prompt": "",
     # LatentSync post-processing parameters (per-request tunable)
     "latentsync_steps": 20,       # denoising steps for LatentSync (20 = default)
     "latentsync_guidance": 1.5,   # CFG scale for LatentSync
