@@ -660,22 +660,32 @@ def handler(event):
             image_path, audio_path, job_dir, input_data
         )
 
-        # ── 4. Stage 2: LatentSync — refine lip sync on the generated video ──
+        # ── 4. Upload the RAW EchoMimicV3 output (pre-LatentSync) ──
+        # This lets us diagnose whether face-structure drift is coming from
+        # EchoMimicV3 generation or from LatentSync's face-crop inpainting.
+        base_s3_key = f"echomimic_v3/{job_id}_base.mp4"
+        base_video_url = upload_to_s3(base_video, base_s3_key)
+
+        # ── 5. Stage 2: LatentSync — refine lip sync on the generated video ──
         if p.get("latentsync_enabled", True):
             final_video = os.path.join(job_dir, "output_synced.mp4")
             run_latentsync(base_video, audio_path, final_video, job_dir, p)
+            synced_s3_key = f"echomimic_v3/{job_id}_synced.mp4"
+            synced_video_url = upload_to_s3(final_video, synced_s3_key)
         else:
             logger.info("LatentSync disabled via payload — skipping.")
-            final_video = base_video
-
-        # ── 5. Upload to S3 ──
-        s3_key = f"echomimic_v3/{job_id}.mp4"
-        video_url = upload_to_s3(final_video, s3_key)
+            synced_video_url = base_video_url
 
         subprocess.run(["rm", "-rf", job_dir], capture_output=True)
 
         return {
-            "video_url": video_url,
+            # Primary output — the LatentSync-refined video (or base if disabled)
+            "video_url": synced_video_url,
+            # Both stages exposed separately so face-drift source can be diagnosed:
+            #   base_video_url  — raw EchoMimicV3 output, before lip refinement
+            #   synced_video_url — same as video_url, after LatentSync refinement
+            "base_video_url": base_video_url,
+            "synced_video_url": synced_video_url,
             "job_id": job_id,
             "status": "success",
         }
