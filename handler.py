@@ -461,7 +461,19 @@ def run_echomimic_v3(image_path, audio_path, job_dir, user_params):
     generator = torch.Generator(device=DEVICE).manual_seed(seed)
 
     # ── Chunked generation with overlap blending ──
+    # current_ref: rolling window of last-N frames from the previous chunk.
+    #              Feeds get_image_to_video_latent3 to maintain MOTION continuity
+    #              across chunk boundaries (prevents the "reset to portrait"
+    #              flicker every 3.24 seconds).
+    # identity_clip_image: locked to the ORIGINAL portrait for every chunk.
+    #              This prevents IDENTITY drift that would otherwise compound
+    #              across chunks (chunk 3's clip_image would be conditioned on
+    #              chunk 2's drifted frames, which was conditioned on chunk 1's,
+    #              etc. — user-visible as "face gets sharper / changes character
+    #              after ~6 seconds"). Keeping motion via input_video while
+    #              anchoring identity via clip_image is the production fix.
     current_ref = ref_image
+    identity_clip_image = None
     new_sample = None
     init_frames = 0
 
@@ -478,12 +490,17 @@ def run_echomimic_v3(image_path, audio_path, job_dir, user_params):
                 video_length=chunk_len,
                 sample_size=[sample_h, sample_w],
             )
+            # Capture the original portrait's CLIP conditioning once.
+            identity_clip_image = clip_image
         else:
-            input_video, input_video_mask, clip_image = get_image_to_video_latent3(
+            input_video, input_video_mask, _ = get_image_to_video_latent3(
                 current_ref, None,
                 video_length=chunk_len,
                 sample_size=[sample_h, sample_w],
             )
+            # Override: use the ORIGINAL portrait's CLIP image, not the drifted
+            # current_ref[0] that latent3 would have returned.
+            clip_image = identity_clip_image
 
         chunk_audio = audio_embeds[:, init_frames: init_frames + chunk_len]
 
