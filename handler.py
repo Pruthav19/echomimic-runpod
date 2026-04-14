@@ -101,16 +101,17 @@ DEFAULTS = {
     "num_skip_start_steps": 8,   # == num_inference_steps → TeaCache disabled
     "riflex_k": 6,
     "shift": 5.0,
-    # Chunking controls face-drift accumulation across long videos.
-    # Each chunk boundary is a potential drift point (model re-conditions on
-    # the previous chunk's output). Fewer, longer chunks = less drift.
-    #   81 frames (3.24s) → 15s video = 5 chunks = 4 drift transitions
-    #   161 frames (6.44s) → 15s video = 2-3 chunks = 1-2 drift transitions
-    # 161 is safe on H100 (uses ~40 GB VRAM of the 80 GB budget). RiFlex
-    # handles the length extension beyond trained sequence length.
-    # Overlap reduced 8→4: halves the drifted-frame conditioning carried
-    # into each subsequent chunk. 4 frames = 160ms crossfade, still smooth.
-    "partial_video_length": 161,  # frames per chunk (161 = 6.44s @ 25fps)
+    # Chunking is THE source of face-structure drift. Every chunk boundary
+    # re-conditions the model on drifted frames from the previous chunk,
+    # and the bias compounds. Best fix: make chunks large enough that most
+    # videos fit in ONE chunk (zero drift) and longer ones only cross one
+    # boundary.
+    #   81 frames (3.24s) → 10s video = 4 chunks (3 drift boundaries)
+    #  241 frames (9.64s) → 10s video = 1 chunk (zero drift)
+    #                     → 15s video = 2 chunks (1 drift boundary)
+    # RiFlex (enable_riflex) handles length extension beyond trained seq.
+    # H100 80 GB has plenty of headroom — 241 frames at 768×768 bf16 fits.
+    "partial_video_length": 241,  # frames per chunk (241 = 9.64s @ 25fps)
     "overlap_video_length": 4,    # overlap frames blended between chunks
     # Prompt and negative_prompt feed T5 text encoder → cross-attention in
     # the transformer. This is EchoMimicV3's documented control surface for
@@ -118,14 +119,15 @@ DEFAULTS = {
     # the negative prompt (combined via CFG since guidance_scale > 1) pushes
     # the model *away* from static / stiff outputs. Adapted from official
     # infer_preview.py negative prompt.
-    "prompt": (
-        "A person is speaking expressively with natural head movements, "
-        "lively facial expressions, and engaged eye contact."
-    ),
+    # Prompt kept minimal. Earlier versions with "engaged eye contact" and
+    # "lively facial expressions" were pushing the model toward rapid
+    # blinking and over-animated faces, especially in later chunks where
+    # the effect compounds. Let the model use its default motion priors.
+    "prompt": "A person is speaking naturally.",
     "negative_prompt": (
         "static, stiff, frozen, motionless, expressionless, blank stare, "
         "unnatural, robotic, rigid posture, bad hands, "
-        "twisted fingers, blurry, low quality."
+        "twisted fingers, blurry, low quality, rapid blinking, twitching."
     ),
     # LatentSync post-processing parameters (per-request tunable)
     "latentsync_steps": 20,       # denoising steps for LatentSync (20 = default)
