@@ -101,8 +101,17 @@ DEFAULTS = {
     "num_skip_start_steps": 8,   # == num_inference_steps → TeaCache disabled
     "riflex_k": 6,
     "shift": 5.0,
-    "partial_video_length": 81,  # frames per chunk (81 = 3.24s @ 25fps)
-    "overlap_video_length": 8,   # overlap frames blended between chunks
+    # Chunking controls face-drift accumulation across long videos.
+    # Each chunk boundary is a potential drift point (model re-conditions on
+    # the previous chunk's output). Fewer, longer chunks = less drift.
+    #   81 frames (3.24s) → 15s video = 5 chunks = 4 drift transitions
+    #   161 frames (6.44s) → 15s video = 2-3 chunks = 1-2 drift transitions
+    # 161 is safe on H100 (uses ~40 GB VRAM of the 80 GB budget). RiFlex
+    # handles the length extension beyond trained sequence length.
+    # Overlap reduced 8→4: halves the drifted-frame conditioning carried
+    # into each subsequent chunk. 4 frames = 160ms crossfade, still smooth.
+    "partial_video_length": 161,  # frames per chunk (161 = 6.44s @ 25fps)
+    "overlap_video_length": 4,    # overlap frames blended between chunks
     # Prompt and negative_prompt feed T5 text encoder → cross-attention in
     # the transformer. This is EchoMimicV3's documented control surface for
     # motion/expression. The positive prompt describes *desired* dynamics;
@@ -377,18 +386,22 @@ def run_latentsync(base_video, audio_path, output_path, job_dir, p):
     ]
 
     logger.info(f"Running LatentSync lip sync refinement → {output_path}")
+    # Stream stdout/stderr live instead of capturing — LatentSync prints
+    # tqdm progress bars and model loading status. Capturing makes the run
+    # look "stuck" from the outside when it's actually loading weights
+    # (Whisper tiny + UNet ~3 GB = 30–60 s on first invocation).
     result = subprocess.run(
         cmd,
         cwd=LATENTSYNC_DIR,
-        capture_output=True,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
         text=True,
     )
 
     if result.returncode != 0:
-        logger.error(f"LatentSync stderr:\n{result.stderr}")
         raise RuntimeError(
             f"LatentSync failed (exit {result.returncode}). "
-            "See logs for details."
+            "See streamed stderr above for details."
         )
 
     logger.info("LatentSync completed successfully.")
