@@ -110,6 +110,15 @@ DEFAULTS = {
     "shift": 5.0,
     "partial_video_length": 81,  # TRAINED length — do not change
     "overlap_video_length": 8,   # 8-frame crossfade at chunk boundaries
+    # Identity anchor reset: every N chunks, force current_ref back to the
+    # original portrait (re-using get_image_to_video_latent2 like chunk 1).
+    # This bounds cross-chunk identity drift — the CLIP lock alone can't
+    # stop pixel-level drift propagating through input_video conditioning
+    # over many chunks. For a 26s video (8 chunks) with reset_every=3, the
+    # face "snaps back" to the original at chunks 3 and 6, keeping drift
+    # bounded to ~3 chunks of accumulation. Tradeoff: a visible micro-pop
+    # at reset boundaries. Set to 0 to disable resets entirely.
+    "identity_reset_every_n_chunks": 3,
     # Prompts kept minimal. The model was trained on real talking-head
     # videos; its natural motion priors (blink rate, head movement, facial
     # expression) are already good. Descriptive prompts ("expressive",
@@ -482,6 +491,8 @@ def run_echomimic_v3(image_path, audio_path, job_dir, user_params):
     identity_clip_image = None
     new_sample = None
     init_frames = 0
+    chunk_idx = 0
+    reset_every = int(p["identity_reset_every_n_chunks"])
 
     while init_frames < total_video_length:
         remaining = total_video_length - init_frames
@@ -490,15 +501,35 @@ def run_echomimic_v3(image_path, audio_path, job_dir, user_params):
         if chunk_len <= 0:
             break
 
-        if init_frames == 0:
+        # Decide whether this chunk should reset to the original portrait.
+        # Reset happens on chunk 0 (first chunk) always, and periodically
+        # on chunks where chunk_idx > 0 and chunk_idx % reset_every == 0.
+        is_identity_reset = (
+            chunk_idx > 0
+            and reset_every > 0
+            and chunk_idx % reset_every == 0
+        )
+
+        if chunk_idx == 0 or is_identity_reset:
+            # Use the ORIGINAL portrait via latent2 — pixel-level identity
+            # reset that bounds cross-chunk drift accumulation.
             input_video, input_video_mask, clip_image = get_image_to_video_latent2(
-                current_ref, None,
+                ref_image, None,
                 video_length=chunk_len,
                 sample_size=[sample_h, sample_w],
             )
-            # Capture the original portrait's CLIP conditioning once.
-            identity_clip_image = clip_image
+            if chunk_idx == 0:
+                # Capture the original portrait's CLIP conditioning once.
+                identity_clip_image = clip_image
+            else:
+                logger.info(
+                    f"Identity reset at chunk {chunk_idx} "
+                    f"(init_frames={init_frames}) — anchoring to original portrait"
+                )
+                clip_image = identity_clip_image
         else:
+            # Rolling reference: last overlap_len frames of previous chunk.
+            # Preserves motion continuity across chunk boundaries.
             input_video, input_video_mask, _ = get_image_to_video_latent3(
                 current_ref, None,
                 video_length=chunk_len,
@@ -563,6 +594,7 @@ def run_echomimic_v3(image_path, audio_path, job_dir, user_params):
         ]
 
         init_frames += chunk_len - overlap_len
+        chunk_idx += 1
         if init_frames + overlap_len >= total_video_length:
             break
 
