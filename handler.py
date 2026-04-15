@@ -85,13 +85,20 @@ DTYPE = torch.bfloat16
 FPS = 25
 
 # ── Default inference parameters (EchoMimicV3-Flash) ─────────────
-# Flash is designed for 8-step fast inference with good visual quality.
-# Lip sync is handled by LatentSync (post-processing), so we tune these
-# for visual fidelity and smooth motion — not lip tracking.
+# All values match the official run_flash.sh — the model was trained for
+# these settings. Deviations (longer chunks, expressive prompts, negative
+# prompts about eyes) all measurably degraded motion quality in testing.
+# LatentSync handles lip sync as a separate post-processing stage; we let
+# EchoMimicV3 use its trained defaults for everything else.
+#
+# Key invariant: partial_video_length=81 is the TRAINED sequence length.
+# Going longer (e.g. 161, 241) extends positional encoding via RiFlex but
+# dilutes temporal attention dynamics, producing muted blinks/expression.
+# Going longer is a non-starter for motion quality.
 DEFAULTS = {
     "num_inference_steps": 8,
     "guidance_scale": 6.0,
-    "audio_guidance_scale": 2.5,
+    "audio_guidance_scale": 3.0,
     "neg_scale": 1.0,
     "neg_steps": 0,
     "audio_scale": 1.0,  # NOTE: dead param in upstream pipeline, kept for API parity
@@ -101,32 +108,15 @@ DEFAULTS = {
     "num_skip_start_steps": 8,   # == num_inference_steps → TeaCache disabled
     "riflex_k": 6,
     "shift": 5.0,
-    # Chunking is THE source of face-structure drift. Every chunk boundary
-    # re-conditions the model on drifted frames from the previous chunk,
-    # and the bias compounds. Best fix: make chunks large enough that most
-    # videos fit in ONE chunk (zero drift) and longer ones only cross one
-    # boundary.
-    #   81 frames (3.24s) → 10s video = 4 chunks (3 drift boundaries)
-    #  241 frames (9.64s) → 10s video = 1 chunk (zero drift)
-    #                     → 15s video = 2 chunks (1 drift boundary)
-    # RiFlex (enable_riflex) handles length extension beyond trained seq.
-    # H100 80 GB has plenty of headroom — 241 frames at 768×768 bf16 fits.
-    "partial_video_length": 241,  # frames per chunk (241 = 9.64s @ 25fps)
-    "overlap_video_length": 4,    # overlap frames blended between chunks
-    # Prompt and negative_prompt feed T5 text encoder → cross-attention in
-    # the transformer. This is EchoMimicV3's documented control surface for
-    # motion/expression. The positive prompt describes *desired* dynamics;
-    # the negative prompt (combined via CFG since guidance_scale > 1) pushes
-    # the model *away* from static / stiff outputs. Adapted from official
-    # infer_preview.py negative prompt.
-    # Keep prompts minimal — matches the original run_flash.sh default.
-    # The model was trained on real talking-head videos; its natural motion
-    # priors (blink rate, head movement, facial expression) are already good.
-    # Any descriptive prompt language ("expressive", "engaged eye contact")
-    # disrupted the priors. Any negative language about eyes ("blank stare",
-    # "rapid blinking") caused the CFG to suppress blinks entirely for most
-    # of the video, then dump them at the end where the signal escapes.
-    # Don't fight the model — let its priors drive motion; LatentSync
+    "partial_video_length": 81,  # TRAINED length — do not change
+    "overlap_video_length": 8,   # 8-frame crossfade at chunk boundaries
+    # Prompts kept minimal. The model was trained on real talking-head
+    # videos; its natural motion priors (blink rate, head movement, facial
+    # expression) are already good. Descriptive prompts ("expressive",
+    # "engaged eye contact") disrupt the priors. Negative prompts about
+    # eyes ("blank stare", "rapid blinking") caused CFG to suppress blinks
+    # for most of the video then dump them at the end. Don't fight the
+    # model — let its priors drive motion; LatentSync
     # handles lip sync independently.
     "prompt": "A person is speaking.",
     "negative_prompt": "",
