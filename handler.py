@@ -18,6 +18,8 @@ import runpod
 import boto3
 import requests
 
+from download_models import download_models
+
 WORKSPACE = Path("/tmp/workspace")
 HALLO4_DIR = Path("/app/hallo4")
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/runpod-volume/models"))
@@ -71,6 +73,11 @@ DEFAULTS = {
 }
 
 SUPPORTED_HALLO_SIZES = {"480*832", "832*480"}
+AUTO_DOWNLOAD_MODELS = os.environ.get("HALLO4_AUTO_DOWNLOAD", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -177,6 +184,21 @@ def validate_model_paths(paths):
         )
 
 
+def ensure_model_assets():
+    model_paths = resolve_model_paths()
+    try:
+        validate_model_paths(model_paths)
+        return resolve_model_paths()
+    except FileNotFoundError:
+        if not AUTO_DOWNLOAD_MODELS:
+            raise
+        logger.warning("Hallo4 model assets are missing; attempting on-demand download.")
+        download_models()
+        model_paths = resolve_model_paths()
+        validate_model_paths(model_paths)
+        return model_paths
+
+
 def media_duration_seconds(path: Path) -> float:
     proc = subprocess.run(
         [
@@ -276,8 +298,7 @@ def run_hallo4(avatar_path: Path, audio_path: Path, output_path: Path, params: d
     output_dir.mkdir(parents=True, exist_ok=True)
     conditioning_video_path = output_path.parent / "conditioning.mp4"
 
-    model_paths = resolve_model_paths()
-    validate_model_paths(model_paths)
+    model_paths = ensure_model_assets()
     create_conditioning_video(
         avatar_path,
         audio_path,
