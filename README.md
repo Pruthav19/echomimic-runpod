@@ -22,9 +22,20 @@ Optional (kept for client compatibility):
 - `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`
 - `HALLO4_COMMAND_TEMPLATE` (override Hallo4 command if your checkout uses different CLI)
 - `HALLO4_HF_REPO` (optional HuggingFace repo for model auto-download)
+- `HF_TOKEN` (required for automatic download from the gated official repo)
 - `HALLO4_MODEL_PATH`, `HALLO4_CKPT_DIR`, `HALLO4_AUDIO_SEPARATOR_MODEL_PATH`, `HALLO4_WAV2VEC_MODEL_PATH` (optional explicit model paths)
 
-The official Hallo4 model repo is `fudan-generative-ai/hallo4`, but it is gated on Hugging Face. Accept the model terms first, then either mount the snapshot into `MODEL_DIR` or set `HALLO4_HF_REPO` with a token-enabled environment.
+The official Hallo4 model repo is `fudan-generative-ai/hallo4`, but it is gated on Hugging Face. Accept the model terms first, then either mount the snapshot into `MODEL_DIR` or set `HF_TOKEN` so the container can download it on first boot. `HALLO4_HF_REPO` defaults to `fudan-generative-ai/hallo4`.
+
+Expected `MODEL_DIR` layout after download/mount:
+
+```text
+/runpod-volume/models/
+  hallo4/model_weight.pth
+  Wan2.1_Encoders/
+  audio_separator/Kim_Vocal_2.onnx
+  wav2vec/wav2vec2-base-960h/
+```
 
 ## Default Hallo4 command template
 

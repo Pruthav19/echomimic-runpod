@@ -168,7 +168,10 @@ def validate_model_paths(paths):
         raise FileNotFoundError(
             "Hallo4 model assets are missing: "
             + ", ".join(missing)
-            + ". Mount the accepted Hugging Face snapshot at MODEL_DIR, or set "
+            + ". The official repo is gated. Accept access at "
+            "https://huggingface.co/fudan-generative-ai/hallo4, set HF_TOKEN, "
+            "and let start.sh download into MODEL_DIR. Alternatively, mount the "
+            "accepted Hugging Face snapshot at MODEL_DIR, or set "
             "HALLO4_MODEL_PATH, HALLO4_CKPT_DIR, HALLO4_AUDIO_SEPARATOR_MODEL_PATH, "
             "and HALLO4_WAV2VEC_MODEL_PATH."
         )

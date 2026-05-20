@@ -1,27 +1,47 @@
 import os
 import sys
+from pathlib import Path
+
 from huggingface_hub import snapshot_download
 
-MODEL_DIR = os.environ.get("MODEL_DIR", "/runpod-volume/models")
+DEFAULT_HALLO4_HF_REPO = "fudan-generative-ai/hallo4"
+MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/runpod-volume/models"))
+
+
+def required_model_paths():
+    return [
+        MODEL_DIR / "hallo4" / "model_weight.pth",
+        MODEL_DIR / "Wan2.1_Encoders",
+        MODEL_DIR / "audio_separator" / "Kim_Vocal_2.onnx",
+        MODEL_DIR / "wav2vec" / "wav2vec2-base-960h",
+    ]
+
+
+def missing_model_paths():
+    return [path for path in required_model_paths() if not path.exists()]
 
 
 def download_models():
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(str(MODEL_DIR), exist_ok=True)
     print(f"Downloading Hallo4 models to {MODEL_DIR}...")
 
-    # Set this env var to your Hallo4 model repo (HF), e.g. org/repo-name
-    repo_id = os.environ.get("HALLO4_HF_REPO", "")
-    if not repo_id:
-        print("HALLO4_HF_REPO is not set. Skipping automatic model download.")
-        print("Mount models into MODEL_DIR or set HALLO4_HF_REPO for auto-download.")
-        return
+    repo_id = os.environ.get("HALLO4_HF_REPO", DEFAULT_HALLO4_HF_REPO)
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
     snapshot_download(
         repo_id=repo_id,
-        local_dir=MODEL_DIR,
+        local_dir=str(MODEL_DIR),
         local_dir_use_symlinks=False,
+        token=token,
     )
-    print("Hallo4 models downloaded.")
+
+    missing = missing_model_paths()
+    if missing:
+        raise FileNotFoundError(
+            "Hallo4 model download finished, but required files are still missing: "
+            + ", ".join(str(path) for path in missing)
+        )
+    print("Hallo4 models downloaded and verified.")
 
 
 if __name__ == "__main__":
@@ -29,4 +49,10 @@ if __name__ == "__main__":
         download_models()
     except Exception as e:
         print(f"Download failed: {e}", file=sys.stderr)
+        print(
+            "The official Hallo4 repo is gated. Accept access at "
+            "https://huggingface.co/fudan-generative-ai/hallo4, then set HF_TOKEN "
+            "or mount the snapshot into MODEL_DIR.",
+            file=sys.stderr,
+        )
         sys.exit(1)
