@@ -17,11 +17,8 @@ RUN pip install --upgrade pip setuptools wheel
 RUN git clone https://github.com/fudan-generative-vision/hallo4.git /app/hallo4
 
 WORKDIR /app/hallo4
-# Install Hallo4 deps, skipping repo-local wheel paths that reference unavailable build-machine files.
-RUN if [ -f requirements.txt ]; then \
-      awk 'NF && $0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*(\/|\.|~).*\.whl([[:space:]]|$)/' requirements.txt > /tmp/hallo4.requirements.clean.txt && \
-      pip install -r /tmp/hallo4.requirements.clean.txt; \
-    fi
+# Install Hallo4 dependencies when available
+RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
