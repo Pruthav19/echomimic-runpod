@@ -115,10 +115,10 @@ def resolve_model_paths():
     if not model_path:
         model_path = _first_existing(
             [
-                MODEL_DIR / "hallo4" / "model_weight.pth",
                 MODEL_DIR / "hallo4" / "model_weight.ckpt",
-                MODEL_DIR / "pretrained_models" / "hallo4" / "model_weight.pth",
+                MODEL_DIR / "hallo4" / "model_weight.pth",
                 MODEL_DIR / "pretrained_models" / "hallo4" / "model_weight.ckpt",
+                MODEL_DIR / "pretrained_models" / "hallo4" / "model_weight.pth",
                 HALLO4_DIR / "pretrained_models" / "hallo4" / "model_weight.pth",
                 HALLO4_DIR / "pretrained_models" / "hallo4" / "model_weight.ckpt",
             ]
@@ -142,8 +142,8 @@ def resolve_model_paths():
     if not wav2vec_model_path:
         wav2vec_model_path = _first_existing(
             [
-                MODEL_DIR / "wav2vec" / "wav2vec2-base-960h",
                 MODEL_DIR / "wav2vec2-base-960h",
+                MODEL_DIR / "wav2vec" / "wav2vec2-base-960h",
                 MODEL_DIR / "pretrained_models" / "wav2vec" / "wav2vec2-base-960h",
                 MODEL_DIR / "pretrained_models" / "wav2vec2-base-960h",
                 HALLO4_DIR / "pretrained_models" / "wav2vec" / "wav2vec2-base-960h",

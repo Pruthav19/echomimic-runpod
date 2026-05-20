@@ -8,17 +8,37 @@ DEFAULT_HALLO4_HF_REPO = "fudan-generative-ai/hallo4"
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/runpod-volume/models"))
 
 
-def required_model_paths():
+def required_model_path_groups():
     return [
-        MODEL_DIR / "hallo4" / "model_weight.pth",
-        MODEL_DIR / "Wan2.1_Encoders",
-        MODEL_DIR / "audio_separator" / "Kim_Vocal_2.onnx",
-        MODEL_DIR / "wav2vec" / "wav2vec2-base-960h",
+        [
+            MODEL_DIR / "hallo4" / "model_weight.ckpt",
+            MODEL_DIR / "hallo4" / "model_weight.pth",
+            MODEL_DIR / "pretrained_models" / "hallo4" / "model_weight.ckpt",
+            MODEL_DIR / "pretrained_models" / "hallo4" / "model_weight.pth",
+        ],
+        [
+            MODEL_DIR / "Wan2.1_Encoders",
+            MODEL_DIR / "pretrained_models" / "Wan2.1_Encoders",
+        ],
+        [
+            MODEL_DIR / "audio_separator" / "Kim_Vocal_2.onnx",
+            MODEL_DIR / "pretrained_models" / "audio_separator" / "Kim_Vocal_2.onnx",
+        ],
+        [
+            MODEL_DIR / "wav2vec2-base-960h",
+            MODEL_DIR / "wav2vec" / "wav2vec2-base-960h",
+            MODEL_DIR / "pretrained_models" / "wav2vec2-base-960h",
+            MODEL_DIR / "pretrained_models" / "wav2vec" / "wav2vec2-base-960h",
+        ],
     ]
 
 
 def missing_model_paths():
-    return [path for path in required_model_paths() if not path.exists()]
+    return [
+        group[0]
+        for group in required_model_path_groups()
+        if not any(path.exists() for path in group)
+    ]
 
 
 def download_models():

@@ -31,10 +31,10 @@ Expected `MODEL_DIR` layout after download/mount:
 
 ```text
 /runpod-volume/models/
-  hallo4/model_weight.pth
+  hallo4/model_weight.ckpt
   Wan2.1_Encoders/
   audio_separator/Kim_Vocal_2.onnx
-  wav2vec/wav2vec2-base-960h/
+  wav2vec2-base-960h/
 ```
 
 ## Default Hallo4 command template
