@@ -17,23 +17,11 @@ RUN pip install --upgrade pip setuptools wheel
 RUN git clone https://github.com/fudan-generative-vision/hallo4.git /app/hallo4
 
 WORKDIR /app/hallo4
-# Sanitize upstream requirements to avoid broken local wheel paths.
-# Drops only local wheel file lines such as:
-#   /cpfs01/.../*.whl, ./x.whl, ../x.whl, ~/x.whl
+# Install Hallo4 deps from sanitized requirements:
+# - drops blank/comment lines
+# - drops local wheel paths like /cpfs01/.../*.whl, ./x.whl, ../x.whl, ~/x.whl
 RUN if [ -f requirements.txt ]; then \
-      cat > /tmp/sanitize_hallo4_reqs.awk <<'AWK' \
-/^[[:space:]]*($|#)/ { next }
-{
-  line=$0
-  s=$0
-  sub(/^[[:space:]]+/, "", s)
-  split(s, tok, /[[:space:]]+/)
-  t=tolower(tok[1])
-  if ((index(t, "/")==1 || index(t, "./")==1 || index(t, "../")==1 || index(t, "~/")==1) && t ~ /\.whl$/) next
-  print line
-}
-AWK
-      awk -f /tmp/sanitize_hallo4_reqs.awk requirements.txt > /tmp/hallo4.requirements.clean.txt && \
+      python -c "from pathlib import Path; import shlex; src=Path('requirements.txt'); out=Path('/tmp/hallo4.requirements.clean.txt'); keep=[];\nfor raw in src.read_text().splitlines():\n s=raw.strip();\n if not s or s.startswith('#'): continue;\n if s.startswith(('-r ','--requirement ','-c ','--constraint ','--find-links ','-f ')): keep.append(raw); continue;\n tok=(shlex.split(s, comments=True)[:1] or [''])[0]; low=tok.lower();\n bad=low.endswith('.whl') and (tok.startswith('/') or tok.startswith('./') or tok.startswith('../') or tok.startswith('~/'));\n if not bad: keep.append(raw);\nout.write_text('\\n'.join(keep)+('\\n' if keep else '')); print(f'Sanitized requirements: kept {len(keep)} lines')" && \
       pip install -r /tmp/hallo4.requirements.clean.txt; \
     fi
 
