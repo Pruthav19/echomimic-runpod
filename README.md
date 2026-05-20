@@ -22,23 +22,37 @@ Optional (kept for client compatibility):
 - `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`
 - `HALLO4_COMMAND_TEMPLATE` (override Hallo4 command if your checkout uses different CLI)
 - `HALLO4_HF_REPO` (optional HuggingFace repo for model auto-download)
+- `HALLO4_MODEL_PATH`, `HALLO4_CKPT_DIR`, `HALLO4_AUDIO_SEPARATOR_MODEL_PATH`, `HALLO4_WAV2VEC_MODEL_PATH` (optional explicit model paths)
+
+The official Hallo4 model repo is `fudan-generative-ai/hallo4`, but it is gated on Hugging Face. Accept the model terms first, then either mount the snapshot into `MODEL_DIR` or set `HALLO4_HF_REPO` with a token-enabled environment.
 
 ## Default Hallo4 command template
 
 ```bash
-python inference.py \
-  --image {avatar} \
-  --audio {audio} \
-  --output {output} \
-  --steps {steps} \
-  --cfg {cfg} \
-  --fps {fps} \
-  --seed {seed} \
+python -m vace.vace_wan_inference \
+  --prompt {prompt} \
+  --src_video {conditioning_video} \
+  --src_ref_images {avatar} \
+  --src_audio {audio} \
+  --save_dir {output_dir} \
+  --model_path {model_path} \
+  --ckpt_dir {ckpt_dir} \
+  --audio_separator_model_path {audio_separator_model_path} \
+  --wav2vec_model_path {wav2vec_model_path} \
+  --sample_steps {steps} \
+  --sample_guide_scale {cfg} \
+  --base_seed {seed} \
   --size {size}
 ```
 
 Supported placeholders:
-- `{avatar}` `{audio}` `{output}` `{steps}` `{cfg}` `{fps}` `{seed}` `{size}`
+- `{avatar}` `{audio}` `{conditioning_video}` `{output}` `{output_dir}`
+- `{steps}` `{cfg}` `{fps}` `{seed}` `{size}` `{prompt}`
+- `{model_dir}` `{model_path}` `{ckpt_dir}` `{audio_separator_model_path}` `{wav2vec_model_path}`
+
+The handler creates `{conditioning_video}` from the avatar image because upstream Hallo4 expects `--src_video` plus `--src_ref_images`. Hallo4 writes `*_out_video.mp4` inside `{output_dir}`; the handler copies the latest generated output to `{output}` before S3 upload.
+
+Hallo4 supports `hallo_size` values `480*832` and `832*480`. If you send the older numeric `target_size` value, the handler keeps it in `params_used` for compatibility but runs Hallo4 with the default `480*832`.
 
 If Hallo4 exposes a different entrypoint/flags, set `HALLO4_COMMAND_TEMPLATE` accordingly.
 
