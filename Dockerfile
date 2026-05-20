@@ -17,37 +17,11 @@ RUN pip install --upgrade pip setuptools wheel
 RUN git clone https://github.com/fudan-generative-vision/hallo4.git /app/hallo4
 
 WORKDIR /app/hallo4
-# Sanitize upstream requirements to avoid broken local wheel paths.
+# Install Hallo4 deps from sanitized requirements:
+# - drops blank/comment lines
+# - drops local wheel paths like /cpfs01/.../*.whl, ./x.whl, ../x.whl, ~/x.whl
 RUN if [ -f requirements.txt ]; then \
-      cat > /tmp/sanitize_hallo4_requirements.py <<'PY'
-from pathlib import Path
-import shlex
-
-src = Path("requirements.txt")
-out = Path("/tmp/hallo4.requirements.clean.txt")
-
-keep = []
-for raw in src.read_text().splitlines():
-    s = raw.strip()
-    if not s or s.startswith("#"):
-        continue
-    if s.startswith(("-r ", "--requirement ", "-c ", "--constraint ", "--find-links ", "-f ")):
-        keep.append(raw)
-        continue
-
-    token = (shlex.split(s, comments=True)[:1] or [""])[0]
-    low = token.lower()
-    is_local_wheel = (
-        low.endswith(".whl")
-        and (token.startswith("/") or token.startswith("./") or token.startswith("../") or token.startswith("~/"))
-    )
-    if not is_local_wheel:
-        keep.append(raw)
-
-out.write_text("\n".join(keep) + ("\n" if keep else ""))
-print(f"Sanitized requirements: kept {len(keep)} lines")
-PY
-      python /tmp/sanitize_hallo4_requirements.py && \
+      python -c "from pathlib import Path; import shlex; src=Path('requirements.txt'); out=Path('/tmp/hallo4.requirements.clean.txt'); keep=[];\nfor raw in src.read_text().splitlines():\n s=raw.strip();\n if not s or s.startswith('#'): continue;\n if s.startswith(('-r ','--requirement ','-c ','--constraint ','--find-links ','-f ')): keep.append(raw); continue;\n tok=(shlex.split(s, comments=True)[:1] or [''])[0]; low=tok.lower();\n bad=low.endswith('.whl') and (tok.startswith('/') or tok.startswith('./') or tok.startswith('../') or tok.startswith('~/'));\n if not bad: keep.append(raw);\nout.write_text('\\n'.join(keep)+('\\n' if keep else '')); print(f'Sanitized requirements: kept {len(keep)} lines')" && \
       pip install -r /tmp/hallo4.requirements.clean.txt; \
     fi
 
