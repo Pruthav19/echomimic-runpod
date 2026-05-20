@@ -17,39 +17,8 @@ RUN pip install --upgrade pip setuptools wheel
 RUN git clone https://github.com/fudan-generative-vision/hallo4.git /app/hallo4
 
 WORKDIR /app/hallo4
-# Install Hallo4 deps from a sanitized requirements file.
-# Upstream may contain absolute/local wheel paths (e.g. /cpfs01/...flash_attn...whl)
-# that do not exist in container builds and cause OSError during pip install.
-RUN if [ -f requirements.txt ]; then \
-      python - <<'PY' \
-from pathlib import Path \
-import shlex \
- \
-src = Path('requirements.txt') \
-out = Path('/tmp/hallo4.requirements.clean.txt') \
- \
-def should_skip(raw_line: str) -> bool: \
-    line = raw_line.strip() \
-    if not line or line.startswith('#'): \
-        return True \
-    if line.startswith(('-r ', '--requirement ', '-c ', '--constraint ', '--find-links ', '-f ')): \
-        return False \
-    token = shlex.split(line, comments=True)[0] if line else '' \
-    lower = token.lower() \
-    if lower.endswith('.whl') and (token.startswith('/') or token.startswith('./') or token.startswith('../') or token.startswith('~/')): \
-        return True \
-    return False \
- \
-cleaned = [] \
-for raw in src.read_text().splitlines(): \
-    if should_skip(raw): \
-        continue \
-    cleaned.append(raw) \
-out.write_text('\n'.join(cleaned) + ('\n' if cleaned else '')) \
-print(f'Wrote sanitized requirements to {out} with {len(cleaned)} entries') \
-PY
-      pip install -r /tmp/hallo4.requirements.clean.txt; \
-    fi
+# Install Hallo4 dependencies when available
+RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
