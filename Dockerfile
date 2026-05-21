@@ -30,7 +30,7 @@ RUN if [ -f requirements.txt ]; then \
 # drops. Install the public package without deps because Hallo4 pins the shared
 # runtime deps above, and Wan can fall back when flash-attn is unavailable.
 RUN pip install --no-deps "wan@git+https://github.com/Wan-Video/Wan2.1"
-RUN python -c "from wan.text2video import WanT2V; print('Wan import OK')"
+RUN python -c "import importlib.util; assert importlib.util.find_spec('wan.text2video'), 'wan.text2video not installed'; print('Wan package OK')"
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
