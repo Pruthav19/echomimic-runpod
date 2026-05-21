@@ -4,6 +4,7 @@ set -e
 echo "Starting Hallo4 RunPod Worker..."
 MODEL_DIR="${MODEL_DIR:-/runpod-volume/models}"
 SENTINEL="${MODEL_DIR}/.download_complete_hallo4"
+mkdir -p /root/.triton/autotune /tmp/workspace
 
 models_present() {
     { [ -f "${MODEL_DIR}/hallo4/model_weight.ckpt" ] || [ -f "${MODEL_DIR}/hallo4/model_weight.pth" ] || [ -f "${MODEL_DIR}/pretrained_models/hallo4/model_weight.ckpt" ] || [ -f "${MODEL_DIR}/pretrained_models/hallo4/model_weight.pth" ]; } &&
