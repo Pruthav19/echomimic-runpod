@@ -6,6 +6,14 @@ from huggingface_hub import snapshot_download
 
 DEFAULT_HALLO4_HF_REPO = "fudan-generative-ai/hallo4"
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/runpod-volume/models"))
+HF_TOKEN_ENV_NAMES = (
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "HUGGINGFACE_HUB_TOKEN",
+    "HF_HUB_TOKEN",
+    "HUGGINGFACE_TOKEN",
+    "HUGGING_FACE_TOKEN",
+)
 
 
 def required_model_path_groups():
@@ -41,19 +49,45 @@ def missing_model_paths():
     ]
 
 
+def resolve_hf_token():
+    for name in HF_TOKEN_ENV_NAMES:
+        token = os.environ.get(name)
+        if token:
+            return name, token
+    return None, None
+
+
 def download_models():
     os.makedirs(str(MODEL_DIR), exist_ok=True)
     print(f"Downloading Hallo4 models to {MODEL_DIR}...")
 
     repo_id = os.environ.get("HALLO4_HF_REPO", DEFAULT_HALLO4_HF_REPO)
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    token_name, token = resolve_hf_token()
+    if not token:
+        raise RuntimeError(
+            f"{repo_id} is gated, but no Hugging Face token was found. "
+            f"Set one of: {', '.join(HF_TOKEN_ENV_NAMES)}."
+        )
+    print(f"Using Hugging Face token from {token_name}.")
 
-    snapshot_download(
-        repo_id=repo_id,
-        local_dir=str(MODEL_DIR),
-        local_dir_use_symlinks=False,
-        token=token,
-    )
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=str(MODEL_DIR),
+            local_dir_use_symlinks=False,
+            token=token,
+        )
+    except Exception as e:
+        message = str(e)
+        if "401" in message or "gated repo" in message.lower() or "restricted" in message.lower():
+            raise RuntimeError(
+                f"Cannot access gated Hugging Face repo {repo_id}. The token from "
+                f"{token_name} is missing access, expired, or belongs to an account "
+                "that has not accepted the model terms. Accept access with that same "
+                "Hugging Face account, create a read token, update the RunPod env, "
+                "and restart the worker."
+            ) from e
+        raise
 
     missing = missing_model_paths()
     if missing:
